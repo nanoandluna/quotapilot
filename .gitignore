@@ -112,3 +112,11 @@ temp/
 # Manus version file (auto-generated, not part of source)
 client/public/__manus__/version.json
 .project-config.json
+
+# Manus workspace metadata and internal planning (not part of the public repository)
+.manus/
+.manus-logs/
+ideas.md
+todo.md
+architecture_review_notes.md
+quota_aware_research_scheduler_v2.md
