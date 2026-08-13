@@ -8,11 +8,12 @@ const doubles = vi.hoisted(() => ({
 vi.mock("./db", () => ({ getDb: doubles.getDb }));
 vi.mock("./storage", () => ({ storagePut: doubles.storagePut }));
 
-import { claimTaskForLocalExecution, recordTaskAttemptExecution, saveUsageImport } from "./quotaService";
+import { claimTaskForLocalExecution, listWorkspaceDashboard, recordTaskAttemptExecution, saveUsageImport } from "./quotaService";
 
 function selectRows<T>(rows: T[]) {
   const query = {
     limit: async () => rows,
+    orderBy: () => query,
     then: <TResult1 = T[], TResult2 = never>(
       onfulfilled?: ((value: T[]) => TResult1 | PromiseLike<TResult1>) | null,
       onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
@@ -49,6 +50,22 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     })).rejects.toMatchObject({ code: "CONFLICT" });
 
     expect(db.select).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns only the current ACTIVE model versions in the default workspace dashboard", async () => {
+    const activeModel = { id: 22, modelId: "deepseek-v4-pro", isActive: true };
+    const db = {
+      select: sequenceSelect([
+        [{ id: 7, name: "Research" }],
+        [], [], [activeModel], [], [], [], [], [],
+      ]),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    const dashboard = await listWorkspaceDashboard(7);
+
+    expect(dashboard.models).toEqual([activeModel]);
+    expect(dashboard.models.every(model => model.isActive)).toBe(true);
   });
 
   it("records a retryable failed batch when object storage rejects an import", async () => {
@@ -108,6 +125,54 @@ describe("QuotaPilot V0.2 transaction guards", () => {
 
     expect(db.transaction).toHaveBeenCalledTimes(1);
     expect(transaction.select).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["completed", "CONSUMED"],
+    ["failed", "RELEASED"],
+    ["cancelled", "RELEASED"],
+  ] as const)("settles a %s attempt by marking its hard reservation %s and writing a usage event", async (status, expectedReservationStatus) => {
+    const transactionSets = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const eventValues = vi.fn(async () => undefined);
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 100, taskBudgetUsd: "2.000000", requestedModelId: "deepseek-v4-flash" }],
+        [{ id: 200, status: "running", estimatedCostUsd: "0.100000" }],
+        [{ id: 5, provider: "opencode_go" }],
+      ]),
+      update: vi.fn(() => ({ set: transactionSets })),
+      insert: vi.fn(() => ({ values: eventValues })),
+    };
+    const refreshSets = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const db = {
+      transaction: vi.fn(async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)),
+      select: sequenceSelect([
+        [{ id: 7, researchPhase: "development" }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "10.0000", consumedUsd: "0", reservedUsd: "0", dynamicReserveUsd: "0", resetPolicy: "rolling", resetAt: new Date("2026-08-13T18:00:00.000Z"), providerReportedResetAt: null }],
+        [], [], [],
+      ]),
+      update: vi.fn(() => ({ set: refreshSets })),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    const result = await recordTaskAttemptExecution({
+      workspaceId: 7,
+      taskId: 100,
+      attemptId: 200,
+      actualModelId: "deepseek-v4-flash",
+      actualCostUsd: 0.1,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      status,
+      fallback: false,
+      resultClass: "official",
+    });
+
+    expect(result.reservationStatus).toBe(expectedReservationStatus);
+    expect(transactionSets.mock.calls[2]?.[0]).toMatchObject({ status: expectedReservationStatus });
+    expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ source: "task_attempt", externalRef: "attempt:200:settled" }));
   });
 
   it("upgrades a P2 soft reservation only after an execution-time hard budget claim succeeds", async () => {
