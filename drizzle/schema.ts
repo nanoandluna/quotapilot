@@ -524,5 +524,19 @@ export const schedulerSettings = mysqlTable("scheduler_settings", {
   index("scheduler_settings_task_uid_idx").on(table.scheduleCronTaskUid),
 ]);
 
+/** Workspace-scoped renewable lease. It prevents overlapping Heartbeat/worker runs without relying on an in-process lock. */
+export const workerLocks = mysqlTable("worker_locks", {
+  id: int("id").autoincrement().primaryKey(),
+  workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  lockName: varchar("lockName", { length: 96 }).notNull(),
+  holderId: varchar("holderId", { length: 160 }).notNull(),
+  leaseExpiresAt: timestamp("leaseExpiresAt").notNull(),
+  acquiredAt: timestamp("acquiredAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+}, table => [
+  uniqueIndex("worker_locks_workspace_name_unique").on(table.workspaceId, table.lockName),
+  index("worker_locks_lease_expiry_idx").on(table.leaseExpiresAt),
+]);
+
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;

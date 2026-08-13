@@ -162,6 +162,13 @@
       "when": 1786634425081,
       "tag": "0022_cheerful_agent_zero",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "5",
+      "when": 1786636842343,
+      "tag": "0023_closed_the_order",
+      "breakpoints": true
     }
   ]
 }
