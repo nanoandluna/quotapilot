@@ -81,7 +81,7 @@ export const quotaRouter = router({
     mimeType: z.enum(["text/csv", "application/json", "text/plain"]),
     content: z.string().min(2).max(4_000_000),
   })).mutation(async ({ ctx, input }) => {
-    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "reviewer");
     if (!/\.(csv|json)$/i.test(input.filename)) throw new TRPCError({ code: "BAD_REQUEST", message: "只支持 .csv 或 .json 文件。" });
     return saveUsageImport({ ...input, userId: ctx.user.id });
   }),
@@ -101,7 +101,7 @@ export const quotaRouter = router({
     experimentId: z.string().max(128).optional(),
     runId: z.string().max(128).optional(),
   })).mutation(async ({ ctx, input }) => {
-    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, input.taskClass === "formal_experiment" || input.resultClass === "official" ? "reviewer" : "researcher");
     return reserveTaskBudget({ ...input, userId: ctx.user.id, requirements: input.requirements });
   }),
   recordAttempt: protectedProcedure.input(z.object({
@@ -120,7 +120,7 @@ export const quotaRouter = router({
     failureReason: z.enum(["QUOTA", "RATE_LIMIT", "TIMEOUT", "PROVIDER_ERROR", "MODEL_UNAVAILABLE", "CONTEXT_OVERFLOW", "TOOL_ERROR", "UNKNOWN"]).optional(),
     resultClass: z.enum(["official", "fallback", "exploratory", "recovery"]),
   })).mutation(async ({ ctx, input }) => {
-    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, input.resultClass === "official" ? "reviewer" : "researcher");
     return recordTaskAttemptExecution(input);
   }),
   claimTask: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), taskId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
@@ -137,7 +137,7 @@ export const quotaRouter = router({
     action: z.enum(["migrate", "queue", "hold", "manual_handoff"]),
     candidateModelId: z.string().min(1).max(160).optional(),
   })).mutation(async ({ ctx, input }) => {
-    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "reviewer");
     if (input.action === "migrate" && !input.candidateModelId) throw new TRPCError({ code: "BAD_REQUEST", message: "迁移操作需要指定候选模型。" });
     const db = await getDb();
     if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });

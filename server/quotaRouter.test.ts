@@ -130,6 +130,35 @@ describe("QuotaPilot V2 route decision state machine", () => {
     expect(doubles.evaluateRouteLabPolicy).toHaveBeenLastCalledWith(expect.objectContaining({ scenario, workspaceId: 7 }));
   });
 
+  it("requires reviewer authority for imported consumption, formal tasks, official results, and route decisions", async () => {
+    const caller = quotaRouter.createCaller(authenticatedContext());
+    doubles.reserveTaskBudget.mockResolvedValue({ taskId: 12 });
+    doubles.recordTaskAttemptExecution.mockResolvedValue({ taskStatus: "completed" });
+    doubles.saveUsageImport.mockResolvedValue({ acceptedRows: 1 });
+
+    await caller.importUsage({ workspaceId: 7, filename: "usage.csv", mimeType: "text/csv", content: "provider,model_id\nopencode_go,deepseek-v4-flash" });
+    expect(doubles.requireWorkspaceRole).toHaveBeenLastCalledWith(7, 1, "reviewer");
+
+    await caller.createTask({ workspaceId: 7, title: "正式复现实验", priority: "P1", taskClass: "formal_experiment", resultClass: "official", estimatedCostUsd: 0.2, taskBudgetUsd: 1 });
+    expect(doubles.requireWorkspaceRole).toHaveBeenLastCalledWith(7, 1, "reviewer");
+
+    await caller.recordAttempt({ workspaceId: 7, taskId: 12, attemptId: 19, actualModelId: "deepseek-v4-pro", actualCostUsd: 0.2, status: "completed", fallback: false, resultClass: "official" });
+    expect(doubles.requireWorkspaceRole).toHaveBeenLastCalledWith(7, 1, "reviewer");
+
+    doubles.getDb.mockResolvedValue(null);
+    await expect(caller.actOnRouteDecision({ workspaceId: 7, decisionId: 10, action: "hold" })).rejects.toMatchObject({ code: "INTERNAL_SERVER_ERROR" });
+    expect(doubles.requireWorkspaceRole).toHaveBeenLastCalledWith(7, 1, "reviewer");
+  });
+
+  it("keeps non-official development task creation available to researchers", async () => {
+    doubles.reserveTaskBudget.mockResolvedValue({ taskId: 13 });
+    const caller = quotaRouter.createCaller(authenticatedContext());
+
+    await caller.createTask({ workspaceId: 7, title: "开发验证", priority: "P2", taskClass: "development", resultClass: "exploratory", estimatedCostUsd: 0.05, taskBudgetUsd: 0.5 });
+
+    expect(doubles.requireWorkspaceRole).toHaveBeenLastCalledWith(7, 1, "researcher");
+  });
+
   it("binds a manually selected migration candidate to the queued attempt before releasing the task back to queue", async () => {
     const rows = [
       [{ id: 100, workspaceId: 7, taskId: 43, admissionDecision: "MIGRATE", selectedModelId: "deepseek-v4-flash", actedAt: null }],
