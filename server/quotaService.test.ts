@@ -169,6 +169,22 @@ describe("QuotaPilot V2 budget engine", () => {
     expect(plan.recommendedModelId).toBe("p0-safe");
   });
 
+  it("blocks a P0 route before reservation when shared availability above the dynamic reserve cannot cover it", () => {
+    const plan = buildUnifiedRoutePlan({
+      priority: "P0",
+      requirements: { reasoning: 8 },
+      routeMode: "balanced",
+      estimatedCostUsd: 0.25,
+      providerContexts: [{ provider: "opencode_go", availableUsd: 0.6, dynamicReserveUsd: 0.5, connectionState: "connected", secretState: "configured" }],
+      models: [{ modelId: "p0-safe", provider: "opencode_go", displayName: "P0 safe", inputPerMillionUsd: 1, outputPerMillionUsd: 1, scarcityFactor: 0.2, maxConcurrency: 2, capability: { code: 8, reasoning: 8, longContext: 8, vision: 0, toolUse: 8, chinese: 8, research: 8, agent: 8, speed: 8, reliability: 9 } }],
+    });
+
+    expect(plan.blockedByBudget).toBe(true);
+    expect(plan.recommendedModelId).toBe("p0-safe");
+    expect(plan.routePlan.selectedModelId).toBeUndefined();
+    expect(plan.routePlan.candidates[0]?.reasons.join(" ")).toContain("P0 无法在动态保护仓");
+  });
+
   it("blocks a task for manual handoff when no model satisfies its capability hard constraints", () => {
     const routing = resolveTaskRouting({ vision: 8, requiresToolUse: true }, [
       { modelId: "text-only", displayName: "Text only", inputPerMillionUsd: 0.1, outputPerMillionUsd: 0.2, scarcityFactor: 0.2, maxConcurrency: 4, capability: { code: 7, reasoning: 7, longContext: 8, vision: 0, toolUse: 8, chinese: 7, research: 7, agent: 6, speed: 10, reliability: 8 } },

@@ -311,6 +311,7 @@ export type RouteMode = "strict" | "balanced" | "emergency";
 export type ProviderRouteContext = {
   provider: "opencode_go" | "openai_api" | "local";
   availableUsd?: number;
+  dynamicReserveUsd?: number;
   connectionState?: "pending_configuration" | "connected" | "degraded" | "error" | "disabled";
   secretState?: "not_configured" | "configured";
 };
@@ -401,14 +402,20 @@ export function buildUnifiedRoutePlan(input: {
     const provider = candidate.provider ?? "opencode_go";
     const context = contextByProvider.get(provider);
     const hasBudget = typeof context?.availableUsd === "number" && context.availableUsd >= input.estimatedCostUsd;
+    const hasP0ReservableBudget = input.priority !== "P0" || (hasBudget && (context?.availableUsd ?? 0) - (context?.dynamicReserveUsd ?? 0) >= input.estimatedCostUsd);
     const reasons = [candidate.reason];
     if (!context) reasons.push("未发现 provider 五小时预算上下文。");
     else if (!hasBudget) reasons.push(`provider 当前可用额度不足：${(context.availableUsd ?? 0).toFixed(4)} USD。`);
+    else if (!hasP0ReservableBudget) reasons.push(`P0 无法在动态保护仓 ${(context?.dynamicReserveUsd ?? 0).toFixed(4)} USD 之上完成硬预留。`);
     if (context && context.secretState !== "configured") reasons.push("provider 凭据尚未配置；该计划只能人工执行或导入结算。");
     if (context && context.connectionState !== "connected") reasons.push(`provider 连接状态为 ${context.connectionState ?? "unknown"}。`);
-    return { candidate, provider, hasBudget, reasons };
+    return { candidate, provider, context, hasBudget, hasP0ReservableBudget, reasons };
   });
-  const eligible = candidates.filter(candidate => candidate.hasBudget);
+  const eligible = candidates.filter(candidate => candidate.hasBudget && candidate.hasP0ReservableBudget).sort((left, right) => {
+    const leftPressure = input.estimatedCostUsd / Math.max(left.context?.availableUsd ?? input.estimatedCostUsd, input.estimatedCostUsd);
+    const rightPressure = input.estimatedCostUsd / Math.max(right.context?.availableUsd ?? input.estimatedCostUsd, input.estimatedCostUsd);
+    return (right.candidate.score - (rightPressure * 8)) - (left.candidate.score - (leftPressure * 8));
+  });
   const requested = input.requestedModelId ? candidates.find(candidate => candidate.candidate.modelId === input.requestedModelId) : undefined;
   let selected: (typeof candidates)[number] | undefined = eligible[0];
   let reason = base.reason;
@@ -416,11 +423,11 @@ export function buildUnifiedRoutePlan(input: {
   let blockedByBudget = false;
 
   if (input.routeMode === "strict") {
-    selected = requested?.hasBudget ? requested : undefined;
+    selected = requested?.hasBudget && requested.hasP0ReservableBudget ? requested : undefined;
     if (!requested) blockedByCapability = true;
-    if (requested && !requested.hasBudget) blockedByBudget = true;
+    if (requested && (!requested.hasBudget || !requested.hasP0ReservableBudget)) blockedByBudget = true;
     if (blockedByBudget) reason = "严格模式指定模型满足能力要求，但其 provider 额度不足；禁止自动换模。";
-  } else if (input.routeMode === "balanced" && requested?.hasBudget) {
+  } else if (input.routeMode === "balanced" && requested?.hasBudget && requested.hasP0ReservableBudget) {
     selected = requested;
   } else if (eligible.length === 0 && !blockedByCapability) {
     selected = undefined;
@@ -951,6 +958,7 @@ export async function reserveTaskBudget(input: {
     return {
       provider: connection.provider as "opencode_go" | "openai_api" | "local",
       availableUsd: budget ? asNumber(budget.limitUsd) - asNumber(budget.consumedUsd) - asNumber(budget.reservedUsd) : undefined,
+      dynamicReserveUsd: budget ? asNumber(budget.dynamicReserveUsd) : undefined,
       connectionState: connection.connectionState,
       secretState: connection.secretState,
     };
@@ -1126,6 +1134,7 @@ export async function evaluateRouteLabPolicy(input: {
       return {
         provider: connection.provider as "opencode_go" | "openai_api" | "local",
         availableUsd: budget ? asNumber(budget.limitUsd) - asNumber(budget.consumedUsd) - asNumber(budget.reservedUsd) : undefined,
+        dynamicReserveUsd: budget ? asNumber(budget.dynamicReserveUsd) : undefined,
         connectionState: connection.connectionState,
         secretState: connection.secretState,
       };
