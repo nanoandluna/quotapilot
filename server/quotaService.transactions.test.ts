@@ -8,7 +8,7 @@ const doubles = vi.hoisted(() => ({
 vi.mock("./db", () => ({ getDb: doubles.getDb }));
 vi.mock("./storage", () => ({ storagePut: doubles.storagePut }));
 
-import { claimTaskForLocalExecution, listWorkspaceDashboard, recordTaskAttemptExecution, saveUsageImport } from "./quotaService";
+import { claimInitialHardReservation, claimTaskForLocalExecution, listWorkspaceDashboard, recordTaskAttemptExecution, saveUsageImport } from "./quotaService";
 
 function selectRows<T>(rows: T[]) {
   const query = {
@@ -52,12 +52,31 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     expect(db.select).toHaveBeenCalledTimes(1);
   });
 
+  it("admits at most one concurrent initial hard reservation against the same shared budget", async () => {
+    let capacityClaimsRemaining = 1;
+    const buildTransaction = () => ({
+      update: vi.fn(() => ({
+        set: () => ({
+          where: async () => [{ affectedRows: capacityClaimsRemaining-- > 0 ? 1 : 0 }],
+        }),
+      })),
+    });
+
+    const outcomes = await Promise.all([
+      claimInitialHardReservation(buildTransaction(), 8, 0.5),
+      claimInitialHardReservation(buildTransaction(), 8, 0.5),
+    ]);
+
+    expect(outcomes.filter(Boolean)).toHaveLength(1);
+    expect(outcomes.filter(outcome => !outcome)).toHaveLength(1);
+  });
+
   it("returns only the current ACTIVE model versions in the default workspace dashboard", async () => {
     const activeModel = { id: 22, modelId: "deepseek-v4-pro", isActive: true };
     const db = {
       select: sequenceSelect([
         [{ id: 7, name: "Research" }],
-        [], [], [activeModel], [], [], [], [], [],
+        [], [], [], [activeModel], [], [], [], [], [], [],
       ]),
     };
     doubles.getDb.mockResolvedValue(db);
@@ -144,6 +163,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
       insert: vi.fn(() => ({ values: eventValues })),
     };
     const refreshSets = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const snapshotValues = vi.fn(async () => undefined);
     const db = {
       transaction: vi.fn(async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)),
       select: sequenceSelect([
@@ -152,6 +172,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
         [], [], [],
       ]),
       update: vi.fn(() => ({ set: refreshSets })),
+      insert: vi.fn(() => ({ values: snapshotValues })),
     };
     doubles.getDb.mockResolvedValue(db);
 
@@ -173,6 +194,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     expect(result.reservationStatus).toBe(expectedReservationStatus);
     expect(transactionSets.mock.calls[2]?.[0]).toMatchObject({ status: expectedReservationStatus });
     expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ source: "task_attempt", externalRef: "attempt:200:settled" }));
+    expect(snapshotValues).toHaveBeenCalledWith(expect.objectContaining({ providerBudgetId: 8, window: "five_hour", limitUsd: "10.0000", state: "GREEN" }));
   });
 
   it("upgrades a P2 soft reservation only after an execution-time hard budget claim succeeds", async () => {
@@ -198,6 +220,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
         [],
       ]),
       update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+      insert: vi.fn(() => ({ values: async () => undefined })),
     };
     doubles.getDb.mockResolvedValue(db);
 
@@ -255,6 +278,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
         [],
       ]),
       update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+      insert: vi.fn(() => ({ values: async () => undefined })),
     };
     doubles.getDb.mockResolvedValue(db);
 
@@ -289,6 +313,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
         [], [], [], [], [],
       ]),
       update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+      insert: vi.fn(() => ({ values: async () => undefined })),
     };
     doubles.getDb.mockResolvedValue(db);
 
@@ -328,6 +353,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
         [], [], [], [], [],
       ]),
       update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+      insert: vi.fn(() => ({ values: async () => undefined })),
     };
     doubles.getDb.mockResolvedValue(db);
 
@@ -366,6 +392,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
         [], [], [], [], [],
       ]),
       update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+      insert: vi.fn(() => ({ values: async () => undefined })),
     };
     doubles.getDb.mockResolvedValue(db);
 

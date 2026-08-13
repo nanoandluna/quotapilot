@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getReservationKind, needsNewModelVersion, parseUsageImport, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels, syncWorkspacePolicyModel } from "./quotaService";
+import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getReservationKind, needsNewModelVersion, parseUsageImport, parseUsageImportDetailed, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels, syncWorkspacePolicyModel } from "./quotaService";
 
 describe("QuotaPilot V2 budget engine", () => {
   it("enters drain protection when the conservative burn rate exhausts budget before reset", () => {
@@ -30,6 +30,16 @@ describe("QuotaPilot V2 budget engine", () => {
       actualCostUsd: 0.002,
       externalRef: "evt-001",
     });
+  });
+
+  it("returns line-level import feedback while preserving valid records", () => {
+    const parsed = parseUsageImportDetailed(
+      "occurred_at,provider,model_id,actual_cost_usd\n2026-08-13T08:00:00Z,opencode_go,deepseek-v4-flash,0.002\ninvalid-time,opencode_go,,not-a-number",
+      "csv",
+    );
+
+    expect(parsed.events).toHaveLength(1);
+    expect(parsed.errors).toEqual([{ row: 2, reason: "缺少 model_id。", fields: ["model_id"] }]);
   });
 
   it("queues noncritical work before it consumes a protected drain window", () => {

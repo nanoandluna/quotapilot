@@ -7,6 +7,7 @@ import {
   modelRegistry,
   providerBudgets,
   providerConnections,
+  quotaSnapshots,
   researchTasks,
   routeDecisions,
   schedulerSettings,
@@ -218,6 +219,17 @@ export function getReservationKind(priority: "P0" | "P1" | "P2" | "P3"): "hard" 
   return undefined;
 }
 
+export async function claimInitialHardReservation(tx: any, providerBudgetId: number, amountUsd: number) {
+  const conditionalReserve = await tx.update(providerBudgets).set({
+    reservedUsd: sql`${providerBudgets.reservedUsd} + ${amountUsd.toFixed(6)}`,
+    updatedAt: new Date(),
+  }).where(and(
+    eq(providerBudgets.id, providerBudgetId),
+    sql`${providerBudgets.limitUsd} - ${providerBudgets.consumedUsd} - ${providerBudgets.reservedUsd} >= ${amountUsd.toFixed(6)}`,
+  ));
+  return conditionalReserve[0].affectedRows === 1;
+}
+
 export type RoutingModel = {
   provider?: "opencode_go" | "openai_api" | "local";
   modelId: string;
@@ -390,7 +402,7 @@ function describeRouteDecision(decision: "ADMIT" | "RESERVE" | "MIGRATE" | "QUEU
   return { reason: "能力、成本和共享预算均满足当前任务准入条件。", action: "run" as const, human: false };
 }
 
-export function parseUsageImport(content: string, format: "csv" | "json"): Array<{
+export type UsageImportRecord = {
   provider: string;
   modelId: string;
   tokens: UsageTokenPayload;
@@ -398,11 +410,21 @@ export function parseUsageImport(content: string, format: "csv" | "json"): Array
   actualCostUsd?: number;
   occurredAt: Date;
   externalRef?: string;
-}> {
+};
+
+export type UsageImportRowError = {
+  row: number;
+  reason: string;
+  fields: string[];
+};
+
+export function parseUsageImportDetailed(content: string, format: "csv" | "json"): { events: UsageImportRecord[]; errors: UsageImportRowError[] } {
   const rawRows: Record<string, unknown>[] = format === "json" ? parseJsonRows(content) : parseCsvRows(content);
   if (!rawRows.length) throw new Error("未检测到可导入的用量记录。");
 
-  return rawRows.map((row, index) => {
+  const events: UsageImportRecord[] = [];
+  const errors: UsageImportRowError[] = [];
+  rawRows.forEach((row, index) => {
     const value = (keys: string[]) => {
       const key = keys.find(candidate => row[candidate] !== undefined && row[candidate] !== "");
       return key ? row[key] : undefined;
@@ -414,16 +436,23 @@ export function parseUsageImport(content: string, format: "csv" | "json"): Array
     const actualCost = value(["actual_cost_usd", "actual_cost", "cost_usd", "cost"]);
     const estimatedCost = value(["estimated_cost_usd", "estimated_cost"]);
 
-    if (!modelId) throw new Error(`第 ${index + 1} 行缺少 model_id。`);
-    if (Number.isNaN(occurredAt.getTime())) throw new Error(`第 ${index + 1} 行的 occurred_at 无法解析。`);
+    if (!modelId) {
+      errors.push({ row: index + 1, reason: "缺少 model_id。", fields: ["model_id"] });
+      return;
+    }
+    if (Number.isNaN(occurredAt.getTime())) {
+      errors.push({ row: index + 1, reason: "occurred_at 无法解析。", fields: ["occurred_at"] });
+      return;
+    }
 
     const parsedActual = actualCost === undefined ? undefined : Number(actualCost);
     const parsedEstimate = estimatedCost === undefined ? 0 : Number(estimatedCost);
     if (Number.isNaN(parsedEstimate) || (parsedActual !== undefined && Number.isNaN(parsedActual))) {
-      throw new Error(`第 ${index + 1} 行的成本字段必须为数字。`);
+      errors.push({ row: index + 1, reason: "成本字段必须为数字。", fields: ["actual_cost_usd", "estimated_cost_usd"] });
+      return;
     }
 
-    return {
+    events.push({
       provider,
       modelId,
       tokens: {
@@ -436,8 +465,18 @@ export function parseUsageImport(content: string, format: "csv" | "json"): Array
       actualCostUsd: parsedActual,
       occurredAt,
       externalRef: String(value(["external_ref", "externalRef", "id"]) ?? "").trim() || undefined,
-    };
+    });
   });
+  return { events, errors };
+}
+
+export function parseUsageImport(content: string, format: "csv" | "json"): UsageImportRecord[] {
+  const parsed = parseUsageImportDetailed(content, format);
+  if (parsed.errors.length) {
+    const first = parsed.errors[0];
+    throw new Error(`第 ${first.row} 行${first.reason}`);
+  }
+  return parsed.events;
 }
 
 function numeric(value: unknown): number {
@@ -623,6 +662,19 @@ export async function refreshWorkspaceBudgets(workspaceId: number) {
       state: state.state,
       updatedAt: new Date(),
     }).where(eq(providerBudgets.id, budget.id));
+    await db.insert(quotaSnapshots).values({
+      workspaceId,
+      providerConnectionId: budget.providerConnectionId,
+      providerBudgetId: budget.id,
+      window: budget.window,
+      limitUsd: budget.limitUsd,
+      consumedUsd: consumed.toFixed(4),
+      reservedUsd: reserved.toFixed(4),
+      dynamicReserveUsd: dynamicReserve.toFixed(4),
+      state: state.state,
+      source: budget.source,
+      capturedAt: now,
+    });
     if (state.state !== "GREEN") {
       await createUnacknowledgedAlert({
         workspaceId,
@@ -677,7 +729,12 @@ export async function saveUsageImport(input: {
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
   const format = input.filename.toLowerCase().endsWith(".json") ? "json" : "csv";
-  const events = parseUsageImport(input.content, format);
+  const parsedImport = parseUsageImportDetailed(input.content, format);
+  const { events, errors } = parsedImport;
+  if (!events.length) {
+    const first = errors[0];
+    throw new TRPCError({ code: "BAD_REQUEST", message: first ? `没有可导入的有效记录：第 ${first.row} 行${first.reason}` : "未检测到可导入的用量记录。" });
+  }
   const checksum = createHash("sha256").update(input.content).digest("hex");
   const duplicate = (await db.select().from(usageImportBatches).where(and(eq(usageImportBatches.workspaceId, input.workspaceId), eq(usageImportBatches.checksum, checksum))).limit(1))[0];
   if (duplicate && duplicate.status !== "failed") throw new TRPCError({ code: "CONFLICT", message: "该文件内容已导入过，请勿重复上传。" });
@@ -701,11 +758,11 @@ export async function saveUsageImport(input: {
           storageKey: stored.key,
           storageUrl: stored.url,
           format,
-          rowsReceived: events.length,
+          rowsReceived: events.length + errors.length,
           rowsAccepted: 0,
-          rowsRejected: 0,
+          rowsRejected: errors.length,
           status: "processing",
-          errorSummary: null,
+          errorSummary: errors.length ? JSON.stringify(errors.slice(0, 100)) : null,
           updatedAt: new Date(),
         }).where(eq(usageImportBatches.id, createdBatchId));
       } else {
@@ -718,8 +775,10 @@ export async function saveUsageImport(input: {
           storageUrl: stored.url,
           checksum,
           format,
-          rowsReceived: events.length,
+          rowsReceived: events.length + errors.length,
           rowsAccepted: 0,
+          rowsRejected: errors.length,
+          errorSummary: errors.length ? JSON.stringify(errors.slice(0, 100)) : null,
           status: "processing",
         });
         createdBatchId = Number(batchResult[0].insertId);
@@ -737,16 +796,19 @@ export async function saveUsageImport(input: {
           tokens: event.tokens,
           estimatedCostUsd: event.estimatedCostUsd.toFixed(6),
           actualCostUsd: event.actualCostUsd?.toFixed(6),
+          budgetWindow: "five_hour" as const,
+          costUnit: "USD",
+          costBasis: event.actualCostUsd === undefined ? "estimated" as const : event.estimatedCostUsd > 0 ? "mixed" as const : "actual" as const,
           source: "import" as const,
           occurredAt: event.occurredAt,
           externalRef: event.externalRef || `batch:${createdBatchId}:row:${index}`,
         };
       }));
-      await tx.update(usageImportBatches).set({ status: "completed", rowsAccepted: events.length, updatedAt: new Date() }).where(eq(usageImportBatches.id, createdBatchId!));
+      await tx.update(usageImportBatches).set({ status: "completed", rowsAccepted: events.length, rowsRejected: errors.length, errorSummary: errors.length ? JSON.stringify(errors.slice(0, 100)) : null, updatedAt: new Date() }).where(eq(usageImportBatches.id, createdBatchId!));
       return createdBatchId!;
     });
     await refreshWorkspaceBudgets(input.workspaceId).catch(error => console.error("[QuotaPilot] import committed but budget refresh failed", error));
-    return { batchId, accepted: events.length, storageUrl: uploaded.url };
+    return { batchId, accepted: events.length, rejected: errors.length, errors, storageUrl: uploaded.url };
   } catch (error) {
     if (isDuplicateKeyError(error)) throw new TRPCError({ code: "CONFLICT", message: "该文件内容已导入过，请勿重复上传。" });
     const failure = {
@@ -877,14 +939,7 @@ export async function reserveTaskBudget(input: {
     let hardReservationCommitted = false;
     let softReservationCommitted = false;
     if (reservationKind === "hard" && admission !== "HOLD") {
-      const conditionalReserve = await tx.update(providerBudgets).set({
-        reservedUsd: sql`${providerBudgets.reservedUsd} + ${input.estimatedCostUsd.toFixed(6)}`,
-        updatedAt: new Date(),
-      }).where(and(
-        eq(providerBudgets.id, budget.id),
-        sql`${providerBudgets.limitUsd} - ${providerBudgets.consumedUsd} - ${providerBudgets.reservedUsd} >= ${input.estimatedCostUsd.toFixed(6)}`,
-      ));
-      hardReservationCommitted = conditionalReserve[0].affectedRows === 1;
+      hardReservationCommitted = await claimInitialHardReservation(tx, budget.id, input.estimatedCostUsd);
       if (hardReservationCommitted) {
         await tx.insert(budgetReservations).values({
           workspaceId: input.workspaceId,
@@ -1068,7 +1123,7 @@ export async function recordTaskAttemptExecution(input: {
     const reservationStatus = input.status === "completed" ? "CONSUMED" : "RELEASED";
     await tx.update(budgetReservations).set({ status: reservationStatus, updatedAt: new Date() }).where(and(eq(budgetReservations.taskId, task.id), eq(budgetReservations.status, "RESERVED")));
     const connection = (await tx.select().from(providerConnections).where(and(eq(providerConnections.workspaceId, input.workspaceId), eq(providerConnections.provider, "opencode_go"))).limit(1))[0];
-    await tx.insert(usageEvents).values({ workspaceId: input.workspaceId, providerConnectionId: connection?.id, provider: "opencode_go", modelId: input.actualModelId, tokens: { inputTokens: input.inputTokens, outputTokens: input.outputTokens, cacheReadTokens: input.cacheReadTokens, cacheWriteTokens: input.cacheWriteTokens }, estimatedCostUsd: attempt.estimatedCostUsd, actualCostUsd: input.actualCostUsd.toFixed(6), source: "task_attempt", occurredAt: new Date(), externalRef: `attempt:${attempt.id}:settled` });
+    await tx.insert(usageEvents).values({ workspaceId: input.workspaceId, providerConnectionId: connection?.id, provider: "opencode_go", modelId: input.actualModelId, tokens: { inputTokens: input.inputTokens, outputTokens: input.outputTokens, cacheReadTokens: input.cacheReadTokens, cacheWriteTokens: input.cacheWriteTokens }, estimatedCostUsd: attempt.estimatedCostUsd, actualCostUsd: input.actualCostUsd.toFixed(6), budgetWindow: "five_hour", costUnit: "USD", costBasis: "mixed", source: "task_attempt", occurredAt: new Date(), externalRef: `attempt:${attempt.id}:settled` });
     return { taskStatus: finalTaskStatus, resultClass: finalResultClass, reservationStatus };
   });
   await refreshWorkspaceBudgets(input.workspaceId);
@@ -1081,6 +1136,7 @@ export async function listWorkspaceDashboard(workspaceId: number) {
   const [workspace] = await db.select().from(workspaces).where(eq(workspaces.id, workspaceId)).limit(1);
   const connections = await db.select().from(providerConnections).where(eq(providerConnections.workspaceId, workspaceId));
   const budgets = await db.select().from(providerBudgets).where(eq(providerBudgets.workspaceId, workspaceId));
+  const snapshots = await db.select().from(quotaSnapshots).where(eq(quotaSnapshots.workspaceId, workspaceId)).orderBy(desc(quotaSnapshots.capturedAt)).limit(72);
   const models = await db.select().from(modelRegistry).where(eq(modelRegistry.isActive, true));
   const tasks = await db.select().from(researchTasks).where(eq(researchTasks.workspaceId, workspaceId)).orderBy(desc(researchTasks.createdAt)).limit(24);
   const attempts = await db.select().from(taskAttempts).where(eq(taskAttempts.workspaceId, workspaceId)).orderBy(desc(taskAttempts.createdAt)).limit(36);
@@ -1088,5 +1144,5 @@ export async function listWorkspaceDashboard(workspaceId: number) {
   const reservations = await db.select().from(budgetReservations).where(and(eq(budgetReservations.workspaceId, workspaceId), eq(budgetReservations.status, "RESERVED")));
   const alerts = await db.select().from(budgetAlerts).where(eq(budgetAlerts.workspaceId, workspaceId)).orderBy(desc(budgetAlerts.createdAt)).limit(12);
   const decisions = await db.select().from(routeDecisions).where(eq(routeDecisions.workspaceId, workspaceId)).orderBy(desc(routeDecisions.createdAt)).limit(24);
-  return { workspace, connections, budgets, models, tasks, attempts, events, reservations, alerts, decisions };
+  return { workspace, connections, budgets, snapshots, models, tasks, attempts, events, reservations, alerts, decisions };
 }

@@ -160,6 +160,25 @@ export const providerBudgets = mysqlTable("provider_budgets", {
   index("provider_budgets_workspace_idx").on(table.workspaceId),
 ]);
 
+/** Immutable budget observations for historical reconstruction; providerBudgets remains the current mutable window state. */
+export const quotaSnapshots = mysqlTable("quota_snapshots", {
+  id: int("id").autoincrement().primaryKey(),
+  workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  providerConnectionId: int("providerConnectionId").notNull().references(() => providerConnections.id, { onDelete: "cascade" }),
+  providerBudgetId: int("providerBudgetId").notNull().references(() => providerBudgets.id, { onDelete: "cascade" }),
+  window: mysqlEnum("snapshotWindow", ["five_hour", "daily", "weekly", "monthly"]).notNull(),
+  limitUsd: decimal("limitUsd", { precision: 12, scale: 4 }).notNull(),
+  consumedUsd: decimal("consumedUsd", { precision: 12, scale: 4 }).notNull(),
+  reservedUsd: decimal("reservedUsd", { precision: 12, scale: 4 }).notNull(),
+  dynamicReserveUsd: decimal("dynamicReserveUsd", { precision: 12, scale: 4 }).notNull(),
+  state: mysqlEnum("snapshotBudgetState", ["GREEN", "YELLOW", "ORANGE", "DRAIN_PROTECTION", "RED"]).notNull(),
+  source: mysqlEnum("snapshotSource", ["manual", "import", "scheduled_sync"]).notNull(),
+  capturedAt: timestamp("capturedAt").defaultNow().notNull(),
+}, table => [
+  index("quota_snapshots_workspace_captured_idx").on(table.workspaceId, table.capturedAt),
+  index("quota_snapshots_budget_captured_idx").on(table.providerBudgetId, table.capturedAt),
+]);
+
 export const modelRegistry = mysqlTable("model_registry", {
   id: int("id").autoincrement().primaryKey(),
   provider: mysqlEnum("registryProvider", ["opencode_go", "openai_api", "local"]).notNull(),
@@ -219,6 +238,9 @@ export const usageEvents = mysqlTable("usage_events", {
   tokens: json("tokens").$type<UsageTokenPayload>().notNull(),
   estimatedCostUsd: decimal("estimatedCostUsd", { precision: 12, scale: 6 }).default("0").notNull(),
   actualCostUsd: decimal("actualCostUsd", { precision: 12, scale: 6 }),
+  budgetWindow: mysqlEnum("usageBudgetWindow", ["five_hour", "daily", "weekly", "monthly"]),
+  costUnit: varchar("costUnit", { length: 12 }).default("USD").notNull(),
+  costBasis: mysqlEnum("costBasis", ["estimated", "actual", "mixed"]).default("actual").notNull(),
   source: mysqlEnum("usageSource", ["import", "manual", "scheduled_sync", "task_attempt"]).notNull(),
   occurredAt: timestamp("occurredAt").notNull(),
   externalRef: varchar("externalRef", { length: 255 }),
