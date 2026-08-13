@@ -27,6 +27,40 @@ import { storagePut } from "./storage";
 
 export type BudgetState = "GREEN" | "YELLOW" | "ORANGE" | "DRAIN_PROTECTION" | "RED";
 export type WorkspaceRole = "owner" | "admin" | "researcher" | "reviewer" | "viewer";
+export type FailureDomain = "QUOTA" | "RATE_LIMIT" | "TIMEOUT" | "PROVIDER_ERROR" | "MODEL_UNAVAILABLE" | "CONTEXT_OVERFLOW" | "TOOL_ERROR" | "UNKNOWN";
+export type FailureExecutionPlan = {
+  contextReductionRatio: number;
+  outputReductionRatio: number;
+  maxToolCalls: number | null;
+  maxAgentSteps: number | null;
+  chunkInput: boolean;
+  preserveRequestedModel: boolean;
+};
+
+export function getFailurePolicy(domain: FailureDomain, priority: "P0" | "P1" | "P2" | "P3") {
+  const strictResearch = priority === "P0" || priority === "P1";
+  const policies: Record<FailureDomain, { recommendedAction: "migrate" | "queue" | "hold" | "manual_handoff"; retryAfterSeconds: number | null; retryMode: "none" | "backoff" | "after_remediation"; circuitScope: "provider_window" | "provider" | "model" | "task" | "tool" | "unknown"; degradationSteps: string[]; requiresHumanHandoff: boolean }> = {
+    QUOTA: { recommendedAction: strictResearch ? "hold" : "migrate", retryAfterSeconds: null, retryMode: "after_remediation", circuitScope: "provider_window", degradationSteps: ["保留正式任务预算", "等待共享窗口重置或选择已验证候选模型"], requiresHumanHandoff: strictResearch },
+    RATE_LIMIT: { recommendedAction: "queue", retryAfterSeconds: strictResearch ? 15 : 30, retryMode: "backoff", circuitScope: "provider", degradationSteps: ["指数退避", "降低并发", "保留请求语义"], requiresHumanHandoff: false },
+    TIMEOUT: { recommendedAction: "queue", retryAfterSeconds: 10, retryMode: "backoff", circuitScope: "model", degradationSteps: ["缩小输出上限", "拆分任务", "降低 Agent 步数"], requiresHumanHandoff: false },
+    PROVIDER_ERROR: { recommendedAction: "queue", retryAfterSeconds: 60, retryMode: "backoff", circuitScope: "provider", degradationSteps: ["短路异常 provider", "等待健康检查恢复", "不静默切换正式结果"], requiresHumanHandoff: strictResearch },
+    MODEL_UNAVAILABLE: { recommendedAction: strictResearch ? "manual_handoff" : "migrate", retryAfterSeconds: null, retryMode: "after_remediation", circuitScope: "model", degradationSteps: ["验证候选模型能力", "重新执行额度与上下文准入", "标记 fallback 或 recovery"], requiresHumanHandoff: strictResearch },
+    CONTEXT_OVERFLOW: { recommendedAction: "queue", retryAfterSeconds: 0, retryMode: "backoff", circuitScope: "task", degradationSteps: ["压缩上下文", "分块输入", "减少工具输出"], requiresHumanHandoff: false },
+    TOOL_ERROR: { recommendedAction: "queue", retryAfterSeconds: 20, retryMode: "backoff", circuitScope: "tool", degradationSteps: ["缩小工具调用", "重试幂等步骤", "隔离失败工具"], requiresHumanHandoff: false },
+    UNKNOWN: { recommendedAction: "manual_handoff", retryAfterSeconds: null, retryMode: "none", circuitScope: "unknown", degradationSteps: ["保留失败证据", "人工复核后再重试"], requiresHumanHandoff: true },
+  };
+  return policies[domain];
+}
+
+export function getFailureExecutionPlan(domain: FailureDomain): FailureExecutionPlan {
+  const baseline: FailureExecutionPlan = { contextReductionRatio: 1, outputReductionRatio: 1, maxToolCalls: null, maxAgentSteps: null, chunkInput: false, preserveRequestedModel: true };
+  const plans: Partial<Record<FailureDomain, FailureExecutionPlan>> = {
+    TIMEOUT: { ...baseline, outputReductionRatio: 0.7, maxToolCalls: 3, maxAgentSteps: 4 },
+    CONTEXT_OVERFLOW: { ...baseline, contextReductionRatio: 0.7, outputReductionRatio: 0.8, maxToolCalls: 3, maxAgentSteps: 3, chunkInput: true },
+    TOOL_ERROR: { ...baseline, maxToolCalls: 2, maxAgentSteps: 3 },
+  };
+  return plans[domain] ?? baseline;
+}
 
 type ModelSeed = {
   modelId: string;
@@ -1065,11 +1099,17 @@ export async function claimTaskForLocalExecution(input: { workspaceId: number; t
       eq(taskAttempts.status, "queued"),
     )).limit(1))[0];
     if (!attempt) throw new TRPCError({ code: "CONFLICT", message: "任务没有可领取的 queued attempt。" });
+    if (attempt.retryNotBefore && attempt.retryNotBefore > new Date()) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: `该 attempt 正在退避，最早可于 ${attempt.retryNotBefore.toISOString()} 重新领取。` });
+    }
     const reservation = (await tx.select().from(budgetReservations).where(eq(budgetReservations.taskId, task.id)).limit(1))[0];
     const connection = (await tx.select().from(providerConnections).where(and(
       eq(providerConnections.workspaceId, input.workspaceId),
       eq(providerConnections.provider, attempt.provider as "opencode_go" | "openai_api" | "chatgpt_plus_manual" | "local"),
     )).limit(1))[0];
+    if (connection?.circuitOpenUntil && connection.circuitOpenUntil > new Date()) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: `Provider 因 ${connection.circuitReason ?? "未知故障"} 正处于短路冷却期，最早可于 ${connection.circuitOpenUntil.toISOString()} 后重新领取。` });
+    }
     const budget = connection ? (await tx.select().from(providerBudgets).where(and(
       eq(providerBudgets.providerConnectionId, connection.id),
       eq(providerBudgets.window, "five_hour"),
@@ -1118,7 +1158,7 @@ export async function claimTaskForLocalExecution(input: { workspaceId: number; t
     if (taskClaim[0].affectedRows !== 1) throw new TRPCError({ code: "CONFLICT", message: "任务已被其他执行者领取。" });
     const attemptClaim = await tx.update(taskAttempts).set({ status: "running", startedAt: new Date() }).where(and(eq(taskAttempts.id, attempt.id), eq(taskAttempts.status, "queued")));
     if (attemptClaim[0].affectedRows !== 1) throw new TRPCError({ code: "CONFLICT", message: "attempt 已被其他执行者领取。" });
-    return { taskId: task.id, attemptId: attempt.id, claimKind, provider: attempt.provider ?? "unknown" };
+    return { taskId: task.id, attemptId: attempt.id, claimKind, provider: attempt.provider ?? "unknown", executionPlan: attempt.executionPlan ?? null };
   });
   await refreshWorkspaceBudgets(input.workspaceId);
   return result;
@@ -1137,6 +1177,7 @@ export async function recordTaskAttemptExecution(input: {
   status: "completed" | "failed" | "cancelled";
   fallback: boolean;
   fallbackReason?: "quota_low" | "rate_limit" | "timeout" | "provider_error" | "model_unavailable" | "context_overflow" | "tool_error" | "manual";
+  failureReason?: FailureDomain;
   resultClass: "official" | "fallback" | "exploratory" | "recovery";
 }) {
   const db = await getDb();
@@ -1160,17 +1201,78 @@ export async function recordTaskAttemptExecution(input: {
     if (input.actualCostUsd > remainingTaskBudget || nextActualCostUsd > cumulativeCostCapUsd) {
       throw new TRPCError({ code: "PRECONDITION_FAILED", message: "实际成本超过任务累计成本上限或剩余预算，系统拒绝写入结算。" });
     }
-    const finalTaskStatus = input.status === "completed" ? "completed" : input.status === "cancelled" ? "cancelled" : "failed";
     const finalResultClass = input.fallback || input.actualModelId !== task.requestedModelId
       ? input.resultClass === "official" ? "fallback" : input.resultClass
       : input.resultClass;
-    await tx.update(taskAttempts).set({ actualModelId: input.actualModelId, fallback: input.fallback || input.actualModelId !== task.requestedModelId, fallbackReason: input.fallback || input.actualModelId !== task.requestedModelId ? input.fallbackReason ?? "manual" : null, resultClass: finalResultClass, status: input.status, actualCostUsd: input.actualCostUsd.toFixed(6), completedAt: new Date() }).where(eq(taskAttempts.id, attempt.id));
-    await tx.update(researchTasks).set({ actualCostUsd: nextActualCostUsd.toFixed(6), remainingBudgetUsd: Math.max(0, cumulativeCostCapUsd - nextActualCostUsd).toFixed(6), resultClass: finalResultClass, status: finalTaskStatus, completedAt: new Date(), updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
+    const failureReason = input.status === "failed" ? input.failureReason ?? "UNKNOWN" : null;
+    const failurePolicy = failureReason ? getFailurePolicy(failureReason, task.priority) : null;
+    const failureExecutionPlan = failureReason ? getFailureExecutionPlan(failureReason) : null;
+    const maxAttempts = task.maxAttempts ?? 3;
+    const attemptNumber = attempt.attemptNumber ?? 1;
+    const canScheduleRetry = input.status === "failed"
+      && failurePolicy?.retryMode === "backoff"
+      && Number(attemptNumber) < maxAttempts;
+    const retryNotBefore = canScheduleRetry
+      ? new Date(Date.now() + (failurePolicy?.retryAfterSeconds ?? 0) * 1_000)
+      : null;
+    const finalTaskStatus = input.status === "completed"
+      ? "completed"
+      : input.status === "cancelled"
+        ? "cancelled"
+        : canScheduleRetry
+          ? "queued"
+          : failurePolicy?.recommendedAction === "hold" || failurePolicy?.recommendedAction === "migrate" || failurePolicy?.recommendedAction === "manual_handoff"
+            ? "paused"
+            : "failed";
+    const completedAt = canScheduleRetry ? null : new Date();
+    await tx.update(taskAttempts).set({ actualModelId: input.actualModelId, fallback: input.fallback || input.actualModelId !== task.requestedModelId, fallbackReason: input.fallback || input.actualModelId !== task.requestedModelId ? input.fallbackReason ?? "manual" : null, failureReason, failurePolicy, resultClass: finalResultClass, status: input.status, actualCostUsd: input.actualCostUsd.toFixed(6), completedAt: new Date() }).where(eq(taskAttempts.id, attempt.id));
+    await tx.update(researchTasks).set({ actualCostUsd: nextActualCostUsd.toFixed(6), remainingBudgetUsd: Math.max(0, cumulativeCostCapUsd - nextActualCostUsd).toFixed(6), resultClass: finalResultClass, status: finalTaskStatus, queuedAt: canScheduleRetry ? new Date() : task.queuedAt, completedAt, updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
+    if (canScheduleRetry) {
+      await tx.insert(taskAttempts).values({
+        workspaceId: input.workspaceId,
+        taskId: task.id,
+        attemptNumber: Number(attemptNumber) + 1,
+        requestedModelId: task.requestedModelId,
+        actualModelId: task.requestedModelId,
+        provider: attempt.provider,
+        quotaState: attempt.quotaState,
+        resultClass: finalResultClass,
+        estimatedCostUsd: attempt.estimatedCostUsd,
+        executionPlan: failureExecutionPlan,
+        retryNotBefore,
+        status: "queued",
+      });
+    }
+    if (failurePolicy && !canScheduleRetry && failurePolicy.recommendedAction !== "queue") {
+      const admissionDecision = failurePolicy.recommendedAction === "migrate"
+        ? "MIGRATE" as const
+        : failurePolicy.recommendedAction === "hold"
+          ? "HOLD" as const
+          : "HOLD" as const;
+      await tx.insert(routeDecisions).values({
+        workspaceId: input.workspaceId,
+        taskId: task.id,
+        attemptId: attempt.id,
+        admissionDecision,
+        budgetState: attempt.quotaState ?? "GREEN",
+        availableUsd: "0.000000",
+        dynamicReserveUsd: "0.000000",
+        estimatedCostUsd: attempt.estimatedCostUsd,
+        reason: `执行失败域 ${failureReason}：${failurePolicy.degradationSteps.join("；")}。`,
+        recommendedAction: failurePolicy.recommendedAction,
+        selectedModelId: task.requestedModelId,
+        requiresHumanHandoff: failurePolicy.requiresHumanHandoff,
+      });
+    }
     const reservationStatus = input.status === "completed" ? "CONSUMED" : "RELEASED";
     await tx.update(budgetReservations).set({ status: reservationStatus, updatedAt: new Date() }).where(and(eq(budgetReservations.taskId, task.id), eq(budgetReservations.status, "RESERVED")));
     const connection = (await tx.select().from(providerConnections).where(and(eq(providerConnections.workspaceId, input.workspaceId), eq(providerConnections.provider, (attempt.provider ?? "opencode_go") as "opencode_go" | "openai_api" | "chatgpt_plus_manual" | "local"))).limit(1))[0];
+    if (failurePolicy && (failurePolicy.circuitScope === "provider" || failurePolicy.circuitScope === "provider_window") && connection) {
+      const circuitOpenUntil = retryNotBefore ?? new Date(Date.now() + 5 * 60 * 1_000);
+      await tx.update(providerConnections).set({ connectionState: "degraded", circuitOpenUntil, circuitReason: failureReason, updatedAt: new Date() }).where(eq(providerConnections.id, connection.id));
+    }
     await tx.insert(usageEvents).values({ workspaceId: input.workspaceId, providerConnectionId: connection?.id, provider: attempt.provider ?? "opencode_go", modelId: input.actualModelId, tokens: { inputTokens: input.inputTokens, outputTokens: input.outputTokens, cacheReadTokens: input.cacheReadTokens, cacheWriteTokens: input.cacheWriteTokens }, estimatedCostUsd: attempt.estimatedCostUsd, actualCostUsd: input.actualCostUsd.toFixed(6), budgetWindow: "five_hour", costUnit: "USD", costBasis: "mixed", source: "task_attempt", occurredAt: new Date(), externalRef: `attempt:${attempt.id}:settled` });
-    return { taskStatus: finalTaskStatus, resultClass: finalResultClass, reservationStatus };
+    return { taskStatus: finalTaskStatus, resultClass: finalResultClass, reservationStatus, failurePolicy, failureExecutionPlan, retryScheduledAt: retryNotBefore };
   });
   await refreshWorkspaceBudgets(input.workspaceId);
   return settled;

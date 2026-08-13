@@ -18,6 +18,14 @@ export type ProviderExecutionRequest = {
   attemptId: number;
   modelId: string;
   idempotencyKey: string;
+  executionPlan?: {
+    contextReductionRatio: number;
+    outputReductionRatio: number;
+    maxToolCalls: number | null;
+    maxAgentSteps: number | null;
+    chunkInput: boolean;
+    preserveRequestedModel: boolean;
+  } | null;
 };
 
 export type ProviderExecutionReceipt = {

@@ -1,0 +1,1 @@
+ALTER TABLE `task_attempts` ADD `failurePolicy` json;

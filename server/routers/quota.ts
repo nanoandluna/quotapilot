@@ -95,6 +95,7 @@ export const quotaRouter = router({
     status: z.enum(["completed", "failed", "cancelled"]),
     fallback: z.boolean().default(false),
     fallbackReason: z.enum(["quota_low", "rate_limit", "timeout", "provider_error", "model_unavailable", "context_overflow", "tool_error", "manual"]).optional(),
+    failureReason: z.enum(["QUOTA", "RATE_LIMIT", "TIMEOUT", "PROVIDER_ERROR", "MODEL_UNAVAILABLE", "CONTEXT_OVERFLOW", "TOOL_ERROR", "UNKNOWN"]).optional(),
     resultClass: z.enum(["official", "fallback", "exploratory", "recovery"]),
   })).mutation(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");

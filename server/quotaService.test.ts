@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getReservationKind, getTaskBudgetAdmission, getTaskRetryAdmission, needsNewModelVersion, parseUsageImport, parseUsageImportDetailed, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels, syncWorkspacePolicyModel } from "./quotaService";
+import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getFailureExecutionPlan, getFailurePolicy, getReservationKind, getTaskBudgetAdmission, getTaskRetryAdmission, needsNewModelVersion, parseUsageImport, parseUsageImportDetailed, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels, syncWorkspacePolicyModel } from "./quotaService";
 
 describe("QuotaPilot V2 budget engine", () => {
   it("enters drain protection when the conservative burn rate exhausts budget before reset", () => {
@@ -98,6 +98,15 @@ describe("QuotaPilot V2 budget engine", () => {
       admitted: false,
       reason: "任务已达到最大尝试次数，拒绝创建新的 attempt。",
     });
+  });
+
+  it("keeps quota, rate-limit, context, and unknown failure domains on distinct offline remediation paths", () => {
+    expect(getFailurePolicy("QUOTA", "P0")).toMatchObject({ recommendedAction: "hold", retryMode: "after_remediation", requiresHumanHandoff: true });
+    expect(getFailurePolicy("RATE_LIMIT", "P2")).toMatchObject({ recommendedAction: "queue", retryAfterSeconds: 30, circuitScope: "provider" });
+    expect(getFailurePolicy("CONTEXT_OVERFLOW", "P2").degradationSteps).toContain("压缩上下文");
+    expect(getFailurePolicy("UNKNOWN", "P3")).toMatchObject({ recommendedAction: "manual_handoff", retryMode: "none", requiresHumanHandoff: true });
+    expect(getFailureExecutionPlan("CONTEXT_OVERFLOW")).toMatchObject({ contextReductionRatio: 0.7, chunkInput: true, maxToolCalls: 3 });
+    expect(getFailureExecutionPlan("TOOL_ERROR")).toMatchObject({ maxToolCalls: 2, maxAgentSteps: 3 });
   });
 
   it("advances expired reset windows according to policy while honoring future provider-reported reset times", () => {

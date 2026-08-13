@@ -188,10 +188,18 @@ describe("QuotaPilot V0.2 transaction guards", () => {
       cacheWriteTokens: 0,
       status,
       fallback: false,
+      failureReason: status === "failed" ? "RATE_LIMIT" : undefined,
       resultClass: "official",
     });
 
     expect(result.reservationStatus).toBe(expectedReservationStatus);
+    if (status === "failed") {
+      expect(transactionSets.mock.calls[0]?.[0]).toMatchObject({ failureReason: "RATE_LIMIT", failurePolicy: { recommendedAction: "queue", retryAfterSeconds: 30 } });
+      expect(result).toMatchObject({ taskStatus: "queued", retryScheduledAt: expect.any(Date) });
+      expect(transactionSets.mock.calls[1]?.[0]).toMatchObject({ status: "queued", completedAt: null });
+      expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ attemptNumber: 2, retryNotBefore: expect.any(Date), status: "queued" }));
+      expect(transactionSets.mock.calls[3]?.[0]).toMatchObject({ connectionState: "degraded", circuitReason: "RATE_LIMIT", circuitOpenUntil: expect.any(Date) });
+    }
     expect(transactionSets.mock.calls[1]?.[0]).toMatchObject({ actualCostUsd: "0.100000", remainingBudgetUsd: "1.900000" });
     expect(transactionSets.mock.calls[2]?.[0]).toMatchObject({ status: expectedReservationStatus });
     expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ source: "task_attempt", externalRef: "attempt:200:settled" }));
@@ -216,6 +224,185 @@ describe("QuotaPilot V0.2 transaction guards", () => {
 
     await expect(claimTaskForLocalExecution({ workspaceId: 7, taskId: 45 })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
     expect(transaction.update).not.toHaveBeenCalled();
+  });
+
+  it("blocks a queued retry until its failure-policy cooldown has elapsed", async () => {
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 46, workspaceId: 7, status: "queued", estimatedCostUsd: "0.100000", taskBudgetUsd: "0.500000", cumulativeCostCapUsd: "0.500000", actualCostUsd: "0.100000", remainingBudgetUsd: "0.400000" }],
+        [{ id: 204, taskId: 46, workspaceId: 7, status: "queued", provider: "opencode_go", retryNotBefore: new Date(Date.now() + 30_000) }],
+      ]),
+      update: vi.fn(),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction) });
+
+    await expect(claimTaskForLocalExecution({ workspaceId: 7, taskId: 46 })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(transaction.update).not.toHaveBeenCalled();
+  });
+
+  it("blocks a claim while the target provider connection is circuit-open", async () => {
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 48, workspaceId: 7, status: "queued", estimatedCostUsd: "0.100000", taskBudgetUsd: "0.500000", cumulativeCostCapUsd: "0.500000", actualCostUsd: "0.100000", remainingBudgetUsd: "0.400000" }],
+        [{ id: 206, taskId: 48, workspaceId: 7, status: "queued", provider: "opencode_go", retryNotBefore: null }],
+        [{ id: 303, taskId: 48, providerBudgetId: 8, reservationKind: "hard", status: "RESERVED" }],
+        [{ id: 5, provider: "opencode_go", circuitReason: "RATE_LIMIT", circuitOpenUntil: new Date(Date.now() + 30_000) }],
+      ]),
+      update: vi.fn(),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction) });
+
+    await expect(claimTaskForLocalExecution({ workspaceId: 7, taskId: 48 })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(transaction.update).not.toHaveBeenCalled();
+  });
+
+  it("pauses a model-unavailable failure and records an auditable migration decision instead of silently switching models", async () => {
+    const transactionSets = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const insertValues = vi.fn(async () => undefined);
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 47, workspaceId: 7, priority: "P2", taskBudgetUsd: "0.500000", cumulativeCostCapUsd: "0.500000", actualCostUsd: "0.000000", remainingBudgetUsd: "0.500000", requestedModelId: "deepseek-v4-flash" }],
+        [{ id: 205, taskId: 47, status: "running", attemptNumber: 1, estimatedCostUsd: "0.100000", provider: "opencode_go", quotaState: "YELLOW" }],
+        [{ id: 5, provider: "opencode_go" }],
+      ]),
+      update: vi.fn(() => ({ set: transactionSets })),
+      insert: vi.fn(() => ({ values: insertValues })),
+    };
+    const refreshSets = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const db = {
+      transaction: vi.fn(async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)),
+      select: sequenceSelect([
+        [{ id: 7, researchPhase: "development" }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "10.0000", consumedUsd: "0", reservedUsd: "0", dynamicReserveUsd: "0", resetPolicy: "rolling", resetAt: new Date("2026-08-13T18:00:00.000Z"), providerReportedResetAt: null }],
+        [], [], [],
+      ]),
+      update: vi.fn(() => ({ set: refreshSets })),
+      insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    const result = await recordTaskAttemptExecution({
+      workspaceId: 7,
+      taskId: 47,
+      attemptId: 205,
+      actualModelId: "deepseek-v4-flash",
+      actualCostUsd: 0.1,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      status: "failed",
+      fallback: false,
+      failureReason: "MODEL_UNAVAILABLE",
+      resultClass: "official",
+    });
+
+    expect(result).toMatchObject({ taskStatus: "paused", failurePolicy: { recommendedAction: "migrate", retryMode: "after_remediation" } });
+    expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({ admissionDecision: "MIGRATE", recommendedAction: "migrate", requiresHumanHandoff: false }));
+  });
+
+  it("queues a context-overflow retry with persisted executable compression constraints", async () => {
+    const transactionSets = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const insertValues = vi.fn(async () => undefined);
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 49, workspaceId: 7, priority: "P2", maxAttempts: 3, taskBudgetUsd: "0.500000", cumulativeCostCapUsd: "0.500000", actualCostUsd: "0.000000", remainingBudgetUsd: "0.500000", requestedModelId: "deepseek-v4-flash" }],
+        [{ id: 207, taskId: 49, status: "running", attemptNumber: 1, estimatedCostUsd: "0.100000", provider: "opencode_go", quotaState: "GREEN" }],
+        [{ id: 5, provider: "opencode_go" }],
+      ]),
+      update: vi.fn(() => ({ set: transactionSets })),
+      insert: vi.fn(() => ({ values: insertValues })),
+    };
+    const db = {
+      transaction: vi.fn(async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)),
+      select: sequenceSelect([
+        [{ id: 7, researchPhase: "development" }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "10.0000", consumedUsd: "0", reservedUsd: "0", dynamicReserveUsd: "0", resetPolicy: "rolling", resetAt: new Date("2026-08-13T18:00:00.000Z"), providerReportedResetAt: null }],
+        [], [], [],
+      ]),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+      insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    const result = await recordTaskAttemptExecution({
+      workspaceId: 7,
+      taskId: 49,
+      attemptId: 207,
+      actualModelId: "deepseek-v4-flash",
+      actualCostUsd: 0.1,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      status: "failed",
+      fallback: false,
+      failureReason: "CONTEXT_OVERFLOW",
+      resultClass: "official",
+    });
+
+    expect(result).toMatchObject({ taskStatus: "queued", failureExecutionPlan: { contextReductionRatio: 0.7, outputReductionRatio: 0.8, chunkInput: true } });
+    expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({
+      attemptNumber: 2,
+      executionPlan: expect.objectContaining({ contextReductionRatio: 0.7, outputReductionRatio: 0.8, maxToolCalls: 3, maxAgentSteps: 3, chunkInput: true }),
+    }));
+  });
+
+  it.each([
+    { domain: "TIMEOUT" as const, priority: "P2", taskStatus: "queued", retryMode: "backoff", executionPlan: { outputReductionRatio: 0.7 }, routeAction: undefined, circuit: false },
+    { domain: "PROVIDER_ERROR" as const, priority: "P2", taskStatus: "queued", retryMode: "backoff", executionPlan: { contextReductionRatio: 1 }, routeAction: undefined, circuit: true },
+    { domain: "TOOL_ERROR" as const, priority: "P2", taskStatus: "queued", retryMode: "backoff", executionPlan: { maxToolCalls: 2, maxAgentSteps: 3 }, routeAction: undefined, circuit: false },
+    { domain: "QUOTA" as const, priority: "P0", taskStatus: "paused", retryMode: "after_remediation", executionPlan: undefined, routeAction: "hold", circuit: true },
+    { domain: "UNKNOWN" as const, priority: "P2", taskStatus: "paused", retryMode: "none", executionPlan: undefined, routeAction: "manual_handoff", circuit: false },
+  ])("executes the $domain failure path", async ({ domain, priority, taskStatus, retryMode, executionPlan, routeAction, circuit }) => {
+    const transactionSets = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const insertValues = vi.fn(async () => undefined);
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 90, workspaceId: 7, priority, maxAttempts: 3, taskBudgetUsd: "0.500000", cumulativeCostCapUsd: "0.500000", actualCostUsd: "0.000000", remainingBudgetUsd: "0.500000", requestedModelId: "deepseek-v4-flash" }],
+        [{ id: 290, taskId: 90, status: "running", attemptNumber: 1, estimatedCostUsd: "0.100000", provider: "opencode_go", quotaState: "GREEN" }],
+        [{ id: 5, provider: "opencode_go" }],
+      ]),
+      update: vi.fn(() => ({ set: transactionSets })),
+      insert: vi.fn(() => ({ values: insertValues })),
+    };
+    const db = {
+      transaction: vi.fn(async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)),
+      select: sequenceSelect([
+        [{ id: 7, researchPhase: "development" }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "10.0000", consumedUsd: "0", reservedUsd: "0", dynamicReserveUsd: "0", resetPolicy: "rolling", resetAt: new Date("2026-08-13T18:00:00.000Z"), providerReportedResetAt: null }],
+        [], [], [],
+      ]),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+      insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    const result = await recordTaskAttemptExecution({
+      workspaceId: 7,
+      taskId: 90,
+      attemptId: 290,
+      actualModelId: "deepseek-v4-flash",
+      actualCostUsd: 0.1,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      status: "failed",
+      fallback: false,
+      failureReason: domain,
+      resultClass: "official",
+    });
+
+    expect(result).toMatchObject({ taskStatus, failurePolicy: { retryMode } });
+    if (executionPlan) {
+      expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({ attemptNumber: 2, executionPlan: expect.objectContaining(executionPlan) }));
+    } else {
+      expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({ recommendedAction: routeAction }));
+    }
+    if (circuit) {
+      expect(transactionSets).toHaveBeenCalledWith(expect.objectContaining({ connectionState: "degraded", circuitReason: domain, circuitOpenUntil: expect.any(Date) }));
+    }
   });
 
   it("rejects settlement when cumulative actual cost would exceed the task cap", async () => {
@@ -343,7 +530,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     const transaction = {
       select: sequenceSelect([
         [{ id: 44, workspaceId: 7, status: "queued", estimatedCostUsd: "0.050000" }],
-        [{ id: 202, taskId: 44, workspaceId: 7, status: "queued", provider: "opencode_go" }],
+        [{ id: 202, taskId: 44, workspaceId: 7, status: "queued", provider: "opencode_go", executionPlan: { contextReductionRatio: 0.7, outputReductionRatio: 0.8, maxToolCalls: 3, maxAgentSteps: 3, chunkInput: true, preserveRequestedModel: true } }],
         [],
         [{ id: 5, provider: "opencode_go" }],
         [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "12.0000", consumedUsd: "1.0000", reservedUsd: "0.5000" }],
@@ -369,7 +556,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
 
     const result = await claimTaskForLocalExecution({ workspaceId: 7, taskId: 44 });
 
-    expect(result).toMatchObject({ taskId: 44, attemptId: 202, claimKind: "p3_hard" });
+    expect(result).toMatchObject({ taskId: 44, attemptId: 202, claimKind: "p3_hard", executionPlan: { contextReductionRatio: 0.7, outputReductionRatio: 0.8, chunkInput: true } });
     expect(transaction.insert).toHaveBeenCalledTimes(1);
   });
 

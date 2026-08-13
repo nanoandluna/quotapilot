@@ -55,6 +55,24 @@ export type RoutePlanSnapshot = {
   generatedAt: string;
 };
 
+export type FailurePolicySnapshot = {
+  recommendedAction: "migrate" | "queue" | "hold" | "manual_handoff";
+  retryAfterSeconds: number | null;
+  retryMode: "none" | "backoff" | "after_remediation";
+  circuitScope: "provider_window" | "provider" | "model" | "task" | "tool" | "unknown";
+  degradationSteps: string[];
+  requiresHumanHandoff: boolean;
+};
+
+export type AttemptExecutionPlan = {
+  contextReductionRatio: number;
+  outputReductionRatio: number;
+  maxToolCalls: number | null;
+  maxAgentSteps: number | null;
+  chunkInput: boolean;
+  preserveRequestedModel: boolean;
+};
+
 /** Core user table backing the Manus OAuth flow. */
 export const users = mysqlTable("users", {
   id: int("id").autoincrement().primaryKey(),
@@ -124,6 +142,8 @@ export const providerConnections = mysqlTable("provider_connections", {
   secretState: mysqlEnum("secretState", ["not_configured", "configured"]).default("not_configured").notNull(),
   lastSyncAt: timestamp("lastSyncAt"),
   lastSyncError: text("lastSyncError"),
+  circuitOpenUntil: timestamp("circuitOpenUntil"),
+  circuitReason: mysqlEnum("circuitReason", ["QUOTA", "RATE_LIMIT", "TIMEOUT", "PROVIDER_ERROR", "MODEL_UNAVAILABLE", "CONTEXT_OVERFLOW", "TOOL_ERROR", "UNKNOWN"]),
   syncIntervalMinutes: int("syncIntervalMinutes").default(15).notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
@@ -322,6 +342,7 @@ export const taskAttempts = mysqlTable("task_attempts", {
   fallbackReason: mysqlEnum("fallbackReason", ["quota_low", "rate_limit", "timeout", "provider_error", "model_unavailable", "context_overflow", "tool_error", "manual"]),
   quotaState: mysqlEnum("attemptQuotaState", ["GREEN", "YELLOW", "ORANGE", "DRAIN_PROTECTION", "RED"]),
   failureReason: mysqlEnum("failureReason", ["QUOTA", "RATE_LIMIT", "TIMEOUT", "PROVIDER_ERROR", "MODEL_UNAVAILABLE", "CONTEXT_OVERFLOW", "TOOL_ERROR", "UNKNOWN"]),
+  failurePolicy: json("failurePolicy").$type<FailurePolicySnapshot>(),
   resultClass: mysqlEnum("attemptResultClass", ["official", "fallback", "exploratory", "recovery"])
     .default("exploratory")
     .notNull(),
@@ -332,6 +353,8 @@ export const taskAttempts = mysqlTable("task_attempts", {
   actualCostUsd: decimal("actualCostUsd", { precision: 12, scale: 6 }),
   promptHash: varchar("promptHash", { length: 128 }),
   routeVersion: varchar("routeVersion", { length: 64 }).default("qars-v2").notNull(),
+  executionPlan: json("executionPlan").$type<AttemptExecutionPlan>(),
+  retryNotBefore: timestamp("retryNotBefore"),
   startedAt: timestamp("startedAt"),
   completedAt: timestamp("completedAt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
