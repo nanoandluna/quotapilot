@@ -15,6 +15,7 @@ import {
   routePolicyEvaluations,
   schedulerSettings,
   taskAttempts,
+  taskEvents,
   usageEvents,
   usageImportBatches,
   workspaceMembers,
@@ -1024,6 +1025,13 @@ export async function reserveTaskBudget(input: {
       queuedAt: new Date(),
     });
     const taskId = Number(taskResult[0].insertId);
+    await tx.insert(taskEvents).values({
+      workspaceId: input.workspaceId,
+      taskId,
+      actorUserId: input.userId,
+      kind: "task_created",
+      payload: { priority: input.priority, taskClass: input.taskClass, routeMode: input.routeMode, resultClass: input.resultClass, estimatedCostUsd: input.estimatedCostUsd, taskBudgetUsd: input.taskBudgetUsd },
+    });
     let effectiveAdmission = admission;
     let hardReservationCommitted = false;
     let softReservationCommitted = false;
@@ -1076,10 +1084,19 @@ export async function reserveTaskBudget(input: {
       estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
       status: "queued",
     });
+    const attemptId = Number(attemptResult[0].insertId);
+    await tx.insert(taskEvents).values({
+      workspaceId: input.workspaceId,
+      taskId,
+      attemptId,
+      actorUserId: input.userId,
+      kind: "attempt_queued",
+      payload: { attemptNumber: 1, requestedModelId: recommendedModelId, provider: attemptProvider, admission: effectiveAdmission, taskStatus },
+    });
     await tx.insert(routeDecisions).values({
       workspaceId: input.workspaceId,
       taskId,
-      attemptId: Number(attemptResult[0].insertId),
+      attemptId,
       admissionDecision: effectiveAdmission,
       budgetState: budget.state,
       availableUsd: available.toFixed(6),

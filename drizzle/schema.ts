@@ -398,6 +398,22 @@ export const taskAttempts = mysqlTable("task_attempts", {
   index("task_attempts_workspace_created_idx").on(table.workspaceId, table.createdAt),
 ]);
 
+/** Append-only queue lifecycle events. Mutable task/attempt rows retain current state; this table preserves how that state was reached. */
+export const taskEvents = mysqlTable("task_events", {
+  id: int("id").autoincrement().primaryKey(),
+  workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  taskId: int("taskId").notNull().references(() => researchTasks.id, { onDelete: "cascade" }),
+  attemptId: int("attemptId").references(() => taskAttempts.id, { onDelete: "set null" }),
+  actorUserId: int("actorUserId").references(() => users.id, { onDelete: "set null" }),
+  kind: mysqlEnum("taskEventKind", ["task_created", "attempt_queued", "attempt_claimed", "attempt_settled", "retry_queued", "route_decision", "task_paused", "task_resumed", "task_cancelled"]).notNull(),
+  payload: json("payload").$type<Record<string, unknown>>().notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, table => [
+  index("task_events_workspace_created_idx").on(table.workspaceId, table.createdAt),
+  index("task_events_task_created_idx").on(table.taskId, table.createdAt),
+  index("task_events_attempt_idx").on(table.attemptId),
+]);
+
 /** Immutable per-attempt research ledger. The row is appended only when an attempt is settled and never used as mutable queue state. */
 export const experimentExecutionLedger = mysqlTable("experiment_execution_ledger", {
   id: int("id").autoincrement().primaryKey(),
