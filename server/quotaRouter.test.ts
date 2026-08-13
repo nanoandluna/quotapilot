@@ -181,7 +181,7 @@ describe("QuotaPilot V2 route decision state machine", () => {
 
     expect(result).toMatchObject({ workspaceId: 7, role: "researcher" });
     expect(transaction.update).toHaveBeenCalledTimes(1);
-    expect(transaction.insert).toHaveBeenCalledTimes(1);
+    expect(transaction.insert).toHaveBeenCalledTimes(2);
   });
 
   it("returns a model's version trail through the protected history endpoint", async () => {

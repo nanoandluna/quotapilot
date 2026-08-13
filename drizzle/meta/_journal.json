@@ -141,6 +141,13 @@
       "when": 1786631682660,
       "tag": "0019_flawless_the_hood",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "5",
+      "when": 1786632583032,
+      "tag": "0020_light_lord_tyger",
+      "breakpoints": true
     }
   ]
 }

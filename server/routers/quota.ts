@@ -2,7 +2,7 @@ import { TRPCError } from "@trpc/server";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import { budgetAlerts, modelRegistry, providerBudgets, providerConnections, researchTasks, routeDecisions, taskAttempts, workspaceInvites, workspaceMembers } from "../../drizzle/schema";
+import { budgetAlerts, modelRegistry, providerBudgets, providerConnections, researchTasks, routeDecisions, taskAttempts, workspaceAuditLogs, workspaceInvites, workspaceMembers } from "../../drizzle/schema";
 import { getDb } from "../db";
 import {
   ensurePersonalWorkspace,
@@ -231,7 +231,9 @@ export const quotaRouter = router({
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     const token = randomBytes(24).toString("base64url");
     const result = await db.insert(workspaceInvites).values({ workspaceId: input.workspaceId, email: input.email.trim().toLowerCase(), role: input.role, token, invitedByUserId: ctx.user.id, expiresAt });
-    return { inviteId: Number(result[0].insertId), token, expiresAt, delivery: "pending_manual_delivery" as const };
+    const inviteId = Number(result[0].insertId);
+    await db.insert(workspaceAuditLogs).values({ workspaceId: input.workspaceId, actorUserId: ctx.user.id, action: "member_invited", targetType: "workspace_invite", targetId: String(inviteId), after: { email: input.email.trim().toLowerCase(), role: input.role, expiresAt: expiresAt.toISOString() } });
+    return { inviteId, token, expiresAt, delivery: "pending_manual_delivery" as const };
   }),
   acceptInvite: protectedProcedure.input(z.object({ token: z.string().min(20).max(96) })).mutation(async ({ ctx, input }) => {
     const db = await getDb();
@@ -256,6 +258,7 @@ export const quotaRouter = router({
       ));
       if (consumed[0].affectedRows !== 1) throw new TRPCError({ code: "CONFLICT", message: "邀请已被并发接受。" });
       await tx.insert(workspaceMembers).values({ workspaceId: invite.workspaceId, userId: ctx.user.id, role: invite.role }).onDuplicateKeyUpdate({ set: { updatedAt: acceptedAt } });
+      await tx.insert(workspaceAuditLogs).values({ workspaceId: invite.workspaceId, actorUserId: ctx.user.id, action: "invite_accepted", targetType: "workspace_invite", targetId: String(invite.id), before: { email: invite.email, role: invite.role, status: "pending" }, after: { userId: ctx.user.id, role: invite.role, status: "accepted" } });
       return { workspaceId: invite.workspaceId, role: invite.role, acceptedAt };
     });
   }),
@@ -264,7 +267,10 @@ export const quotaRouter = router({
     if (input.memberUserId === ctx.user.id) throw new TRPCError({ code: "BAD_REQUEST", message: "工作区拥有者不能在此处变更自己的角色；请使用所有权转移流程。" });
     const db = await getDb();
     if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+    const member = (await db.select().from(workspaceMembers).where(and(eq(workspaceMembers.workspaceId, input.workspaceId), eq(workspaceMembers.userId, input.memberUserId))).limit(1))[0];
+    if (!member) throw new TRPCError({ code: "NOT_FOUND", message: "成员不存在。" });
     await db.update(workspaceMembers).set({ role: input.role as WorkspaceRole, updatedAt: new Date() }).where(and(eq(workspaceMembers.workspaceId, input.workspaceId), eq(workspaceMembers.userId, input.memberUserId)));
+    await db.insert(workspaceAuditLogs).values({ workspaceId: input.workspaceId, actorUserId: ctx.user.id, action: "member_role_changed", targetType: "workspace_member", targetId: String(input.memberUserId), before: { role: member.role }, after: { role: input.role } });
     return { ok: true };
   }),
   transferOwnership: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), newOwnerUserId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
@@ -293,6 +299,7 @@ export const quotaRouter = router({
     if (!member) throw new TRPCError({ code: "NOT_FOUND", message: "成员不存在。" });
     if (member.role === "owner") throw new TRPCError({ code: "BAD_REQUEST", message: "不能移除工作区拥有者。" });
     await db.delete(workspaceMembers).where(and(eq(workspaceMembers.workspaceId, input.workspaceId), eq(workspaceMembers.userId, input.memberUserId)));
+    await db.insert(workspaceAuditLogs).values({ workspaceId: input.workspaceId, actorUserId: ctx.user.id, action: "member_removed", targetType: "workspace_member", targetId: String(input.memberUserId), before: { role: member.role }, after: { removed: true } });
     return { ok: true };
   }),
 });
