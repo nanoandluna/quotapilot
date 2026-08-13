@@ -324,12 +324,16 @@ describe("QuotaPilot V2 route decision state machine", () => {
       resultClass: "official",
       estimatedCostUsd: 0.2,
       taskBudgetUsd: 1,
+      gitCommitSha: "a1b2c3d4e5f6",
       idempotencyKey: "00000000-0000-4000-8000-000000000001",
     });
     expect(doubles.requireWorkspaceRole).toHaveBeenLastCalledWith(
       7,
       1,
       "reviewer"
+    );
+    expect(doubles.reserveTaskBudget).toHaveBeenLastCalledWith(
+      expect.objectContaining({ gitCommitSha: "a1b2c3d4e5f6" })
     );
 
     await caller.recordAttempt({
@@ -383,6 +387,26 @@ describe("QuotaPilot V2 route decision state machine", () => {
       1,
       "researcher"
     );
+  });
+
+  it("rejects a non-SHA Git revision before attempting task creation", async () => {
+    const caller = quotaRouter.createCaller(authenticatedContext());
+
+    await expect(
+      caller.createTask({
+        workspaceId: 7,
+        title: "提交版本校验",
+        priority: "P2",
+        taskClass: "development",
+        resultClass: "exploratory",
+        estimatedCostUsd: 0.05,
+        taskBudgetUsd: 0.5,
+        gitCommitSha: "release/2026-08",
+        idempotencyKey: "00000000-0000-4000-8000-000000000003",
+      })
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+
+    expect(doubles.reserveTaskBudget).not.toHaveBeenCalled();
   });
 
   it("binds a manually selected migration candidate to the queued attempt before releasing the task back to queue", async () => {

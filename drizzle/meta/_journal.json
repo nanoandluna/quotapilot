@@ -176,6 +176,13 @@
       "when": 1786637374059,
       "tag": "0024_vengeful_spiral",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "5",
+      "when": 1786638000454,
+      "tag": "0025_jazzy_impossible_man",
+      "breakpoints": true
     }
   ]
 }

@@ -1862,6 +1862,37 @@ function isDuplicateKeyError(error: unknown) {
   );
 }
 
+function getTaskInputHash(input: {
+  title: string;
+  description?: string;
+  requirements: TaskRequirements;
+  requestedModelId?: string;
+  experimentId?: string;
+  runId?: string;
+  estimatedCostUsd: number;
+  taskBudgetUsd: number;
+}) {
+  const requirements = Object.fromEntries(
+    Object.entries(input.requirements).sort(([left], [right]) =>
+      left.localeCompare(right)
+    )
+  );
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        title: input.title.trim(),
+        description: input.description?.trim() ?? "",
+        requirements,
+        requestedModelId: input.requestedModelId ?? null,
+        experimentId: input.experimentId ?? null,
+        runId: input.runId ?? null,
+        estimatedCostUsd: input.estimatedCostUsd,
+        taskBudgetUsd: input.taskBudgetUsd,
+      })
+    )
+    .digest("hex");
+}
+
 async function getIdempotentTaskCreateResult(
   db: any,
   input: { workspaceId: number; idempotencyKey: string }
@@ -1938,6 +1969,7 @@ export async function reserveTaskBudget(input: {
   requirements: TaskRequirements;
   experimentId?: string;
   runId?: string;
+  gitCommitSha?: string;
   idempotencyKey: string;
 }) {
   const db = await getDb();
@@ -1946,6 +1978,7 @@ export async function reserveTaskBudget(input: {
       code: "INTERNAL_SERVER_ERROR",
       message: "数据库连接不可用。",
     });
+  const inputHash = getTaskInputHash(input);
   const priorResult = await getIdempotentTaskCreateResult(db, input);
   if (priorResult) return priorResult;
   const taskBudgetAdmission = getTaskBudgetAdmission(input);
@@ -2095,6 +2128,9 @@ export async function reserveTaskBudget(input: {
         experimentId: input.experimentId,
         runId: input.runId,
         idempotencyKey: input.idempotencyKey,
+        inputHash,
+        // sourceRevision persists a validated Git commit SHA, never arbitrary source text.
+        sourceRevision: input.gitCommitSha,
         status: "queued",
         queuedAt: new Date(),
       });
@@ -2187,6 +2223,8 @@ export async function reserveTaskBudget(input: {
         quotaState: budget.state,
         resultClass: input.resultClass,
         estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
+        promptHash: inputHash,
+        sourceRevision: input.gitCommitSha,
         status: "queued",
       });
       const attemptId = Number(attemptResult[0].insertId);
@@ -2947,6 +2985,7 @@ export async function recordTaskAttemptExecution(input: {
       estimatedCostUsd: attempt.estimatedCostUsd,
       actualCostUsd: input.actualCostUsd.toFixed(6),
       promptHash: attempt.promptHash,
+      sourceRevision: attempt.sourceRevision ?? task.sourceRevision,
       experimentId: task.experimentId,
       runId: task.runId,
       executionPlan: attempt.executionPlan,
@@ -2978,6 +3017,8 @@ export async function recordTaskAttemptExecution(input: {
         quotaState: attempt.quotaState,
         resultClass: finalResultClass,
         estimatedCostUsd: attempt.estimatedCostUsd,
+        promptHash: attempt.promptHash,
+        sourceRevision: attempt.sourceRevision ?? task.sourceRevision,
         executionPlan: failureExecutionPlan,
         retryNotBefore,
         status: "queued",
@@ -3112,24 +3153,22 @@ export async function recordTaskAttemptExecution(input: {
         })
         .where(eq(providerConnections.id, connection.id));
     }
-    await tx
-      .insert(usageEvents)
-      .values({
-        workspaceId: input.workspaceId,
-        providerConnectionId: connection?.id,
-        modelRegistryId: attempt.modelRegistryId,
-        provider: attempt.provider ?? "opencode_go",
-        modelId: input.actualModelId,
-        tokens: tokenSnapshot,
-        estimatedCostUsd: attempt.estimatedCostUsd,
-        actualCostUsd: input.actualCostUsd.toFixed(6),
-        budgetWindow: "five_hour",
-        costUnit: "USD",
-        costBasis: "mixed",
-        source: "task_attempt",
-        occurredAt: new Date(),
-        externalRef: `attempt:${attempt.id}:settled`,
-      });
+    await tx.insert(usageEvents).values({
+      workspaceId: input.workspaceId,
+      providerConnectionId: connection?.id,
+      modelRegistryId: attempt.modelRegistryId,
+      provider: attempt.provider ?? "opencode_go",
+      modelId: input.actualModelId,
+      tokens: tokenSnapshot,
+      estimatedCostUsd: attempt.estimatedCostUsd,
+      actualCostUsd: input.actualCostUsd.toFixed(6),
+      budgetWindow: "five_hour",
+      costUnit: "USD",
+      costBasis: "mixed",
+      source: "task_attempt",
+      occurredAt: new Date(),
+      externalRef: `attempt:${attempt.id}:settled`,
+    });
     await tx.insert(taskEvents).values({
       workspaceId: input.workspaceId,
       taskId: task.id,
@@ -3225,6 +3264,8 @@ export async function queueTaskRetry(input: {
       quotaState: previousAttempt?.quotaState,
       resultClass: task.resultClass,
       estimatedCostUsd: task.estimatedCostUsd,
+      promptHash: previousAttempt?.promptHash ?? task.inputHash,
+      sourceRevision: previousAttempt?.sourceRevision ?? task.sourceRevision,
       status: "queued",
     });
     await tx

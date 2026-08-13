@@ -223,6 +223,7 @@ export default function Home() {
     crypto.randomUUID()
   );
   const [maxContextTokens, setMaxContextTokens] = useState("");
+  const [gitCommitSha, setGitCommitSha] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<
     "researcher" | "reviewer" | "viewer" | "admin"
@@ -672,6 +673,7 @@ export default function Home() {
           : {}),
       },
       experimentId: priority === "P0" ? "formal-run" : undefined,
+      gitCommitSha: gitCommitSha.trim() || undefined,
       idempotencyKey: taskIdempotencyKey,
     });
   };
@@ -2652,6 +2654,18 @@ export default function Home() {
               />
               <small>
                 未填写时仅使用能力矩阵；填写后只允许已核验上下文容量足够的模型进入候选。
+              </small>
+            </label>
+            <label className="dialog-label">
+              Git commit SHA（可选）
+              <input
+                placeholder="例如 a1b2c3d4e5f6"
+                value={gitCommitSha}
+                onChange={event => setGitCommitSha(event.target.value)}
+              />
+              <small>
+                仅接受 7–64 位十六进制提交哈希，将与输入哈希一同固化到
+                task、attempt 与实验账本；不写入代码内容。
               </small>
             </label>
             <label className="dialog-label">

@@ -256,6 +256,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
               provider: "opencode_go",
               quotaState: "GREEN",
               promptHash: "prompt-abc",
+              sourceRevision: "a1b2c3d4",
               estimatedCostUsd: "0.100000",
             },
           ],
@@ -366,6 +367,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
           experimentId: "exp-7",
           runId: "run-3",
           promptHash: "prompt-abc",
+          sourceRevision: "a1b2c3d4",
           tokens: {
             inputTokens: 100,
             outputTokens: 20,

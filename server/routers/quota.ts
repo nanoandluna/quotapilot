@@ -193,6 +193,11 @@ export const quotaRouter = router({
         requirements: taskRequirementsSchema.default({}),
         experimentId: z.string().max(128).optional(),
         runId: z.string().max(128).optional(),
+        gitCommitSha: z
+          .string()
+          .trim()
+          .regex(/^[0-9a-fA-F]{7,64}$/)
+          .optional(),
         idempotencyKey: z.string().uuid(),
       })
     )
@@ -864,31 +869,27 @@ export const quotaRouter = router({
         });
       const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
       const token = randomBytes(24).toString("base64url");
-      const result = await db
-        .insert(workspaceInvites)
-        .values({
-          workspaceId: input.workspaceId,
+      const result = await db.insert(workspaceInvites).values({
+        workspaceId: input.workspaceId,
+        email: input.email.trim().toLowerCase(),
+        role: input.role,
+        token,
+        invitedByUserId: ctx.user.id,
+        expiresAt,
+      });
+      const inviteId = Number(result[0].insertId);
+      await db.insert(workspaceAuditLogs).values({
+        workspaceId: input.workspaceId,
+        actorUserId: ctx.user.id,
+        action: "member_invited",
+        targetType: "workspace_invite",
+        targetId: String(inviteId),
+        after: {
           email: input.email.trim().toLowerCase(),
           role: input.role,
-          token,
-          invitedByUserId: ctx.user.id,
-          expiresAt,
-        });
-      const inviteId = Number(result[0].insertId);
-      await db
-        .insert(workspaceAuditLogs)
-        .values({
-          workspaceId: input.workspaceId,
-          actorUserId: ctx.user.id,
-          action: "member_invited",
-          targetType: "workspace_invite",
-          targetId: String(inviteId),
-          after: {
-            email: input.email.trim().toLowerCase(),
-            role: input.role,
-            expiresAt: expiresAt.toISOString(),
-          },
-        });
+          expiresAt: expiresAt.toISOString(),
+        },
+      });
       return {
         inviteId,
         token,
@@ -978,25 +979,23 @@ export const quotaRouter = router({
             role: invite.role,
           })
           .onDuplicateKeyUpdate({ set: { updatedAt: acceptedAt } });
-        await tx
-          .insert(workspaceAuditLogs)
-          .values({
-            workspaceId: invite.workspaceId,
-            actorUserId: ctx.user.id,
-            action: "invite_accepted",
-            targetType: "workspace_invite",
-            targetId: String(invite.id),
-            before: {
-              email: invite.email,
-              role: invite.role,
-              status: "pending",
-            },
-            after: {
-              userId: ctx.user.id,
-              role: invite.role,
-              status: "accepted",
-            },
-          });
+        await tx.insert(workspaceAuditLogs).values({
+          workspaceId: invite.workspaceId,
+          actorUserId: ctx.user.id,
+          action: "invite_accepted",
+          targetType: "workspace_invite",
+          targetId: String(invite.id),
+          before: {
+            email: invite.email,
+            role: invite.role,
+            status: "pending",
+          },
+          after: {
+            userId: ctx.user.id,
+            role: invite.role,
+            status: "accepted",
+          },
+        });
         return {
           workspaceId: invite.workspaceId,
           role: invite.role,
@@ -1049,17 +1048,15 @@ export const quotaRouter = router({
             eq(workspaceMembers.userId, input.memberUserId)
           )
         );
-      await db
-        .insert(workspaceAuditLogs)
-        .values({
-          workspaceId: input.workspaceId,
-          actorUserId: ctx.user.id,
-          action: "member_role_changed",
-          targetType: "workspace_member",
-          targetId: String(input.memberUserId),
-          before: { role: member.role },
-          after: { role: input.role },
-        });
+      await db.insert(workspaceAuditLogs).values({
+        workspaceId: input.workspaceId,
+        actorUserId: ctx.user.id,
+        action: "member_role_changed",
+        targetType: "workspace_member",
+        targetId: String(input.memberUserId),
+        before: { role: member.role },
+        after: { role: input.role },
+      });
       return { ok: true };
     }),
   transferOwnership: protectedProcedure
@@ -1124,20 +1121,18 @@ export const quotaRouter = router({
           .update(workspaceMembers)
           .set({ role: "owner", updatedAt: new Date() })
           .where(eq(workspaceMembers.id, nextOwner[0].id));
-        await tx
-          .insert(workspaceAuditLogs)
-          .values({
-            workspaceId: input.workspaceId,
-            actorUserId: ctx.user.id,
-            action: "ownership_transferred",
-            targetType: "workspace",
-            targetId: String(input.workspaceId),
-            before: { ownerUserId: ctx.user.id, role: "owner" },
-            after: {
-              ownerUserId: input.newOwnerUserId,
-              previousOwnerRole: "admin",
-            },
-          });
+        await tx.insert(workspaceAuditLogs).values({
+          workspaceId: input.workspaceId,
+          actorUserId: ctx.user.id,
+          action: "ownership_transferred",
+          targetType: "workspace",
+          targetId: String(input.workspaceId),
+          before: { ownerUserId: ctx.user.id, role: "owner" },
+          after: {
+            ownerUserId: input.newOwnerUserId,
+            previousOwnerRole: "admin",
+          },
+        });
       });
       return {
         ok: true,
@@ -1192,17 +1187,15 @@ export const quotaRouter = router({
             eq(workspaceMembers.userId, input.memberUserId)
           )
         );
-      await db
-        .insert(workspaceAuditLogs)
-        .values({
-          workspaceId: input.workspaceId,
-          actorUserId: ctx.user.id,
-          action: "member_removed",
-          targetType: "workspace_member",
-          targetId: String(input.memberUserId),
-          before: { role: member.role },
-          after: { removed: true },
-        });
+      await db.insert(workspaceAuditLogs).values({
+        workspaceId: input.workspaceId,
+        actorUserId: ctx.user.id,
+        action: "member_removed",
+        targetType: "workspace_member",
+        targetId: String(input.memberUserId),
+        before: { role: member.role },
+        after: { removed: true },
+      });
       return { ok: true };
     }),
 });
