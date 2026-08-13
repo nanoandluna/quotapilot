@@ -344,6 +344,28 @@ export default function Home() {
     onError: error =>
       toast.error("无法领取执行", { description: error.message }),
   });
+  const cancelTask = trpc.quota.cancelTask.useMutation({
+    onSuccess: result => {
+      toast.success("任务已取消", {
+        description: `任务 #${result.taskId} 的未消耗预留已释放。`,
+      });
+      if (activeWorkspaceId)
+        utils.quota.dashboard.invalidate({ workspaceId: activeWorkspaceId });
+    },
+    onError: error =>
+      toast.error("无法取消任务", { description: error.message }),
+  });
+  const resumeTask = trpc.quota.resumeTask.useMutation({
+    onSuccess: result => {
+      toast.success("任务已恢复排队", {
+        description: `任务 #${result.taskId} 将在下一次本地领取时重新执行准入检查。`,
+      });
+      if (activeWorkspaceId)
+        utils.quota.dashboard.invalidate({ workspaceId: activeWorkspaceId });
+    },
+    onError: error =>
+      toast.error("无法恢复任务", { description: error.message }),
+  });
   const acknowledgeAlert = trpc.quota.acknowledgeAlert.useMutation({
     onSuccess: () => {
       toast.success("告警已确认");
@@ -1656,39 +1678,61 @@ export default function Home() {
                         <span className={`queue-state state-${task.status}`}>
                           {task.status}
                         </span>
-                        {!decision ? (
-                          <span className="handoff-mark">—</span>
-                        ) : decision.actedAt ? (
-                          <span className="handoff-mark">
-                            {decision.selectedModelId
-                              ? `→ ${decision.selectedModelId}`
-                              : "processed"}
-                          </span>
-                        ) : decision.admissionDecision === "MIGRATE" ? (
-                          <div className="task-action-stack">
-                            <select
-                              value={
-                                candidateModelByDecision[decision.id] ?? ""
-                              }
-                              onChange={event =>
-                                setCandidateModelByDecision(current => ({
-                                  ...current,
-                                  [decision.id]: event.target.value,
-                                }))
-                              }
-                            >
-                              <option value="">选择迁移模型</option>
-                              {data.models.map(model => (
-                                <option key={model.id} value={model.modelId}>
-                                  {model.displayName}
-                                </option>
-                              ))}
-                            </select>
+                        <div className="task-action-stack">
+                          {!decision ? (
+                            <span className="handoff-mark">—</span>
+                          ) : decision.actedAt ? (
+                            <span className="handoff-mark">
+                              {decision.selectedModelId
+                                ? `→ ${decision.selectedModelId}`
+                                : "processed"}
+                            </span>
+                          ) : decision.admissionDecision === "MIGRATE" ? (
+                            <div className="task-action-stack">
+                              <select
+                                value={
+                                  candidateModelByDecision[decision.id] ?? ""
+                                }
+                                onChange={event =>
+                                  setCandidateModelByDecision(current => ({
+                                    ...current,
+                                    [decision.id]: event.target.value,
+                                  }))
+                                }
+                              >
+                                <option value="">选择迁移模型</option>
+                                {data.models.map(model => (
+                                  <option key={model.id} value={model.modelId}>
+                                    {model.displayName}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                className="decision-action"
+                                disabled={
+                                  !activeWorkspaceId ||
+                                  !candidateModelByDecision[decision.id] ||
+                                  actOnRouteDecision.isPending
+                                }
+                                onClick={() =>
+                                  activeWorkspaceId &&
+                                  actOnRouteDecision.mutate({
+                                    workspaceId: activeWorkspaceId,
+                                    decisionId: decision.id,
+                                    action: "migrate",
+                                    candidateModelId:
+                                      candidateModelByDecision[decision.id],
+                                  })
+                                }
+                              >
+                                Migrate
+                              </button>
+                            </div>
+                          ) : decision.admissionDecision === "QUEUE" ? (
                             <button
                               className="decision-action"
                               disabled={
                                 !activeWorkspaceId ||
-                                !candidateModelByDecision[decision.id] ||
                                 actOnRouteDecision.isPending
                               }
                               onClick={() =>
@@ -1696,74 +1740,91 @@ export default function Home() {
                                 actOnRouteDecision.mutate({
                                   workspaceId: activeWorkspaceId,
                                   decisionId: decision.id,
-                                  action: "migrate",
-                                  candidateModelId:
-                                    candidateModelByDecision[decision.id],
+                                  action: "queue",
                                 })
                               }
                             >
-                              Migrate
+                              Queue
                             </button>
-                          </div>
-                        ) : decision.admissionDecision === "QUEUE" ? (
-                          <button
-                            className="decision-action"
-                            disabled={
-                              !activeWorkspaceId || actOnRouteDecision.isPending
-                            }
-                            onClick={() =>
-                              activeWorkspaceId &&
-                              actOnRouteDecision.mutate({
-                                workspaceId: activeWorkspaceId,
-                                decisionId: decision.id,
-                                action: "queue",
-                              })
-                            }
-                          >
-                            Queue
-                          </button>
-                        ) : decision.admissionDecision === "HOLD" ? (
-                          <div className="task-action-stack">
+                          ) : decision.admissionDecision === "HOLD" ? (
+                            <div className="task-action-stack">
+                              <button
+                                className="decision-action muted-action"
+                                disabled={
+                                  !activeWorkspaceId ||
+                                  actOnRouteDecision.isPending
+                                }
+                                onClick={() =>
+                                  activeWorkspaceId &&
+                                  actOnRouteDecision.mutate({
+                                    workspaceId: activeWorkspaceId,
+                                    decisionId: decision.id,
+                                    action: "hold",
+                                  })
+                                }
+                              >
+                                Hold
+                              </button>
+                              <button
+                                className="decision-action"
+                                disabled={
+                                  !activeWorkspaceId ||
+                                  actOnRouteDecision.isPending
+                                }
+                                onClick={() =>
+                                  activeWorkspaceId &&
+                                  actOnRouteDecision.mutate({
+                                    workspaceId: activeWorkspaceId,
+                                    decisionId: decision.id,
+                                    action: "manual_handoff",
+                                  })
+                                }
+                              >
+                                Handoff
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="handoff-mark">
+                              {decision.admissionDecision}
+                            </span>
+                          )}
+                          {task.status === "paused" && (
+                            <button
+                              className="decision-action"
+                              disabled={
+                                !activeWorkspaceId || resumeTask.isPending
+                              }
+                              onClick={() =>
+                                activeWorkspaceId &&
+                                resumeTask.mutate({
+                                  workspaceId: activeWorkspaceId,
+                                  taskId: task.id,
+                                })
+                              }
+                            >
+                              Resume
+                            </button>
+                          )}
+                          {["draft", "queued", "reserved", "paused"].includes(
+                            task.status
+                          ) && (
                             <button
                               className="decision-action muted-action"
                               disabled={
-                                !activeWorkspaceId ||
-                                actOnRouteDecision.isPending
+                                !activeWorkspaceId || cancelTask.isPending
                               }
                               onClick={() =>
                                 activeWorkspaceId &&
-                                actOnRouteDecision.mutate({
+                                cancelTask.mutate({
                                   workspaceId: activeWorkspaceId,
-                                  decisionId: decision.id,
-                                  action: "hold",
+                                  taskId: task.id,
                                 })
                               }
                             >
-                              Hold
+                              Cancel
                             </button>
-                            <button
-                              className="decision-action"
-                              disabled={
-                                !activeWorkspaceId ||
-                                actOnRouteDecision.isPending
-                              }
-                              onClick={() =>
-                                activeWorkspaceId &&
-                                actOnRouteDecision.mutate({
-                                  workspaceId: activeWorkspaceId,
-                                  decisionId: decision.id,
-                                  action: "manual_handoff",
-                                })
-                              }
-                            >
-                              Handoff
-                            </button>
-                          </div>
-                        ) : (
-                          <span className="handoff-mark">
-                            {decision.admissionDecision}
-                          </span>
-                        )}
+                          )}
+                        </div>
                       </div>
                     );
                   })

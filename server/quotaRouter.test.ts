@@ -62,6 +62,43 @@ describe("QuotaPilot V2 route decision state machine", () => {
     doubles.requireWorkspaceRole.mockResolvedValue({ role: "researcher" });
   });
 
+  it("cancels a non-running task with a state CAS, releases its reservation, and records an immutable event", async () => {
+    const task = { id: 42, workspaceId: 7, status: "reserved" };
+    const set = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const eventValues = vi.fn(async () => undefined);
+    const transaction = {
+      select: vi.fn(() => selectRows([task])),
+      update: vi.fn(() => ({ set })),
+      insert: vi.fn(() => ({ values: eventValues })),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: vi.fn((work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)) });
+
+    const result = await quotaRouter.createCaller(authenticatedContext()).cancelTask({ workspaceId: 7, taskId: 42 });
+
+    expect(result).toEqual({ ok: true, taskId: 42, status: "cancelled" });
+    expect(set.mock.calls[0]?.[0]).toMatchObject({ status: "cancelled" });
+    expect(set.mock.calls[1]?.[0]).toMatchObject({ status: "RELEASED" });
+    expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ kind: "task_cancelled", actorUserId: 1, payload: expect.objectContaining({ priorStatus: "reserved" }) }));
+  });
+
+  it("resumes only a paused task through a state CAS and records the queue transition", async () => {
+    const task = { id: 43, workspaceId: 7, status: "paused" };
+    const set = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const eventValues = vi.fn(async () => undefined);
+    const transaction = {
+      select: vi.fn(() => selectRows([task])),
+      update: vi.fn(() => ({ set })),
+      insert: vi.fn(() => ({ values: eventValues })),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: vi.fn((work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)) });
+
+    const result = await quotaRouter.createCaller(authenticatedContext()).resumeTask({ workspaceId: 7, taskId: 43 });
+
+    expect(result).toEqual({ ok: true, taskId: 43, status: "queued" });
+    expect(set).toHaveBeenCalledWith(expect.objectContaining({ status: "queued", queuedAt: expect.any(Date) }));
+    expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ kind: "task_resumed", actorUserId: 1, payload: expect.objectContaining({ source: "manual_resume" }) }));
+  });
+
   it("rejects an already consumed route decision before changing its task", async () => {
     const transaction = { select: vi.fn(() => selectRows([])), update: vi.fn() };
     doubles.getDb.mockResolvedValue({ transaction: vi.fn((work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)) });

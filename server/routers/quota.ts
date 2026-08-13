@@ -2,7 +2,7 @@ import { TRPCError } from "@trpc/server";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import { budgetAlerts, modelRegistry, providerBudgets, providerConnections, researchTasks, routeDecisions, taskAttempts, taskEvents, workspaceAuditLogs, workspaceInvites, workspaceMembers } from "../../drizzle/schema";
+import { budgetAlerts, budgetReservations, modelRegistry, providerBudgets, providerConnections, researchTasks, routeDecisions, taskAttempts, taskEvents, workspaceAuditLogs, workspaceInvites, workspaceMembers } from "../../drizzle/schema";
 import { getDb } from "../db";
 import {
   ensurePersonalWorkspace,
@@ -130,6 +130,63 @@ export const quotaRouter = router({
   retryTask: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), taskId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
     return queueTaskRetry(input);
+  }),
+  cancelTask: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), taskId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    const db = await getDb();
+    if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+    return db.transaction(async tx => {
+      const task = (await tx.select().from(researchTasks).where(and(eq(researchTasks.workspaceId, input.workspaceId), eq(researchTasks.id, input.taskId))).limit(1))[0];
+      if (!task) throw new TRPCError({ code: "NOT_FOUND", message: "任务不存在。" });
+      if (!["draft", "queued", "reserved", "paused"].includes(task.status)) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "仅未运行的草稿、排队、预留或暂停任务可以取消。" });
+      }
+      const now = new Date();
+      const updated = await tx.update(researchTasks).set({ status: "cancelled", completedAt: now, updatedAt: now }).where(and(
+        eq(researchTasks.id, task.id),
+        eq(researchTasks.workspaceId, input.workspaceId),
+        eq(researchTasks.status, task.status),
+      ));
+      if (Number(updated[0]?.affectedRows ?? 0) !== 1) throw new TRPCError({ code: "CONFLICT", message: "任务状态已变更，请刷新后重试。" });
+      await tx.update(budgetReservations).set({ status: "RELEASED", updatedAt: now }).where(and(
+        eq(budgetReservations.taskId, task.id),
+        eq(budgetReservations.workspaceId, input.workspaceId),
+        eq(budgetReservations.status, "RESERVED"),
+      ));
+      await tx.insert(taskEvents).values({
+        workspaceId: input.workspaceId,
+        taskId: task.id,
+        actorUserId: ctx.user.id,
+        kind: "task_cancelled",
+        payload: { priorStatus: task.status, releasedReservation: true },
+      });
+      return { ok: true, taskId: task.id, status: "cancelled" as const };
+    });
+  }),
+  resumeTask: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), taskId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    const db = await getDb();
+    if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+    return db.transaction(async tx => {
+      const task = (await tx.select().from(researchTasks).where(and(eq(researchTasks.workspaceId, input.workspaceId), eq(researchTasks.id, input.taskId))).limit(1))[0];
+      if (!task) throw new TRPCError({ code: "NOT_FOUND", message: "任务不存在。" });
+      if (task.status !== "paused") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "仅暂停任务可以恢复排队。" });
+      const now = new Date();
+      const updated = await tx.update(researchTasks).set({ status: "queued", queuedAt: now, updatedAt: now }).where(and(
+        eq(researchTasks.id, task.id),
+        eq(researchTasks.workspaceId, input.workspaceId),
+        eq(researchTasks.status, "paused"),
+      ));
+      if (Number(updated[0]?.affectedRows ?? 0) !== 1) throw new TRPCError({ code: "CONFLICT", message: "任务状态已变更，请刷新后重试。" });
+      await tx.insert(taskEvents).values({
+        workspaceId: input.workspaceId,
+        taskId: task.id,
+        actorUserId: ctx.user.id,
+        kind: "task_resumed",
+        payload: { source: "manual_resume", priorStatus: "paused", status: "queued" },
+      });
+      return { ok: true, taskId: task.id, status: "queued" as const };
+    });
   }),
   actOnRouteDecision: protectedProcedure.input(z.object({
     workspaceId: z.number().int().positive(),
