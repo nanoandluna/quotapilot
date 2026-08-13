@@ -380,6 +380,38 @@ export const taskAttempts = mysqlTable("task_attempts", {
   index("task_attempts_workspace_created_idx").on(table.workspaceId, table.createdAt),
 ]);
 
+/** Immutable per-attempt research ledger. The row is appended only when an attempt is settled and never used as mutable queue state. */
+export const experimentExecutionLedger = mysqlTable("experiment_execution_ledger", {
+  id: int("id").autoincrement().primaryKey(),
+  workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  taskId: int("taskId").notNull().references(() => researchTasks.id, { onDelete: "cascade" }),
+  attemptId: int("attemptId").notNull().references(() => taskAttempts.id, { onDelete: "cascade" }),
+  modelRegistryId: int("modelRegistryId").references(() => modelRegistry.id, { onDelete: "set null" }),
+  provider: varchar("provider", { length: 64 }).notNull(),
+  requestedModelId: varchar("requestedModelId", { length: 160 }),
+  actualModelId: varchar("actualModelId", { length: 160 }).notNull(),
+  priority: mysqlEnum("ledgerPriority", ["P0", "P1", "P2", "P3"]).notNull(),
+  taskClass: mysqlEnum("ledgerTaskClass", ["formal_experiment", "experiment_pipeline", "development", "convenience"]).notNull(),
+  resultClass: mysqlEnum("ledgerResultClass", ["official", "fallback", "exploratory", "recovery"]).notNull(),
+  status: mysqlEnum("ledgerAttemptStatus", ["completed", "failed", "cancelled"]).notNull(),
+  fallback: boolean("fallback").notNull(),
+  fallbackReason: mysqlEnum("ledgerFallbackReason", ["quota_low", "rate_limit", "timeout", "provider_error", "model_unavailable", "context_overflow", "tool_error", "manual"]),
+  failureReason: mysqlEnum("ledgerFailureReason", ["QUOTA", "RATE_LIMIT", "TIMEOUT", "PROVIDER_ERROR", "MODEL_UNAVAILABLE", "CONTEXT_OVERFLOW", "TOOL_ERROR", "UNKNOWN"]),
+  quotaState: mysqlEnum("ledgerQuotaState", ["GREEN", "YELLOW", "ORANGE", "DRAIN_PROTECTION", "RED"]),
+  tokens: json("tokens").$type<UsageTokenPayload>().notNull(),
+  estimatedCostUsd: decimal("estimatedCostUsd", { precision: 12, scale: 6 }).notNull(),
+  actualCostUsd: decimal("actualCostUsd", { precision: 12, scale: 6 }).notNull(),
+  promptHash: varchar("promptHash", { length: 128 }),
+  experimentId: varchar("experimentId", { length: 128 }),
+  runId: varchar("runId", { length: 128 }),
+  executionPlan: json("executionPlan").$type<AttemptExecutionPlan>(),
+  recordedAt: timestamp("recordedAt").defaultNow().notNull(),
+}, table => [
+  uniqueIndex("experiment_ledger_attempt_unique").on(table.attemptId),
+  index("experiment_ledger_workspace_recorded_idx").on(table.workspaceId, table.recordedAt),
+  index("experiment_ledger_experiment_run_idx").on(table.experimentId, table.runId),
+]);
+
 export const routeDecisions = mysqlTable("route_decisions", {
   id: int("id").autoincrement().primaryKey(),
   workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),

@@ -155,8 +155,8 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     const eventValues = vi.fn(async () => undefined);
     const transaction = {
       select: sequenceSelect([
-        [{ id: 100, taskBudgetUsd: "2.000000", requestedModelId: "deepseek-v4-flash" }],
-        [{ id: 200, status: "running", estimatedCostUsd: "0.100000" }],
+        [{ id: 100, taskBudgetUsd: "2.000000", priority: "P1", taskClass: "formal_experiment", resultClass: "official", experimentId: "exp-7", runId: "run-3", requestedModelId: "deepseek-v4-flash" }],
+        [{ id: 200, status: "running", modelRegistryId: 22, provider: "opencode_go", quotaState: "GREEN", promptHash: "prompt-abc", estimatedCostUsd: "0.100000" }],
         [{ id: 5, provider: "opencode_go" }],
       ]),
       update: vi.fn(() => ({ set: transactionSets })),
@@ -194,7 +194,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
 
     expect(result.reservationStatus).toBe(expectedReservationStatus);
     if (status === "failed") {
-      expect(transactionSets.mock.calls[0]?.[0]).toMatchObject({ failureReason: "RATE_LIMIT", failurePolicy: { recommendedAction: "queue", retryAfterSeconds: 30 } });
+      expect(transactionSets.mock.calls[0]?.[0]).toMatchObject({ failureReason: "RATE_LIMIT", failurePolicy: { recommendedAction: "queue", retryAfterSeconds: 15 } });
       expect(result).toMatchObject({ taskStatus: "queued", retryScheduledAt: expect.any(Date) });
       expect(transactionSets.mock.calls[1]?.[0]).toMatchObject({ status: "queued", completedAt: null });
       expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ attemptNumber: 2, retryNotBefore: expect.any(Date), status: "queued" }));
@@ -202,6 +202,18 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     }
     expect(transactionSets.mock.calls[1]?.[0]).toMatchObject({ actualCostUsd: "0.100000", remainingBudgetUsd: "1.900000" });
     expect(transactionSets.mock.calls[2]?.[0]).toMatchObject({ status: expectedReservationStatus });
+    expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({
+      attemptId: 200,
+      modelRegistryId: 22,
+      priority: "P1",
+      taskClass: "formal_experiment",
+      resultClass: "official",
+      experimentId: "exp-7",
+      runId: "run-3",
+      promptHash: "prompt-abc",
+      tokens: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      actualCostUsd: "0.100000",
+    }));
     expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ source: "task_attempt", externalRef: "attempt:200:settled" }));
     expect(snapshotValues).toHaveBeenCalledWith(expect.objectContaining({ providerBudgetId: 8, window: "five_hour", limitUsd: "10.0000", state: "GREEN" }));
   });

@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import {
   budgetReservations,
   budgetAlerts,
+  experimentExecutionLedger,
   modelConcurrencyBudgets,
   modelRegistry,
   providerBudgets,
@@ -1283,7 +1284,34 @@ export async function recordTaskAttemptExecution(input: {
             ? "paused"
             : "failed";
     const completedAt = canScheduleRetry ? null : new Date();
-    await tx.update(taskAttempts).set({ actualModelId: input.actualModelId, fallback: input.fallback || input.actualModelId !== task.requestedModelId, fallbackReason: input.fallback || input.actualModelId !== task.requestedModelId ? input.fallbackReason ?? "manual" : null, failureReason, failurePolicy, resultClass: finalResultClass, status: input.status, actualCostUsd: input.actualCostUsd.toFixed(6), completedAt: new Date() }).where(eq(taskAttempts.id, attempt.id));
+    const didFallback = input.fallback || input.actualModelId !== task.requestedModelId;
+    const fallbackReason = didFallback ? input.fallbackReason ?? "manual" : null;
+    const tokenSnapshot = { inputTokens: input.inputTokens, outputTokens: input.outputTokens, cacheReadTokens: input.cacheReadTokens, cacheWriteTokens: input.cacheWriteTokens };
+    await tx.update(taskAttempts).set({ actualModelId: input.actualModelId, fallback: didFallback, fallbackReason, failureReason, failurePolicy, resultClass: finalResultClass, status: input.status, actualCostUsd: input.actualCostUsd.toFixed(6), completedAt: new Date() }).where(eq(taskAttempts.id, attempt.id));
+    await tx.insert(experimentExecutionLedger).values({
+      workspaceId: input.workspaceId,
+      taskId: task.id,
+      attemptId: attempt.id,
+      modelRegistryId: attempt.modelRegistryId,
+      provider: attempt.provider ?? "opencode_go",
+      requestedModelId: task.requestedModelId,
+      actualModelId: input.actualModelId,
+      priority: task.priority,
+      taskClass: task.taskClass,
+      resultClass: finalResultClass,
+      status: input.status,
+      fallback: didFallback,
+      fallbackReason,
+      failureReason,
+      quotaState: attempt.quotaState,
+      tokens: tokenSnapshot,
+      estimatedCostUsd: attempt.estimatedCostUsd,
+      actualCostUsd: input.actualCostUsd.toFixed(6),
+      promptHash: attempt.promptHash,
+      experimentId: task.experimentId,
+      runId: task.runId,
+      executionPlan: attempt.executionPlan,
+    });
     await tx.update(researchTasks).set({ actualCostUsd: nextActualCostUsd.toFixed(6), remainingBudgetUsd: Math.max(0, cumulativeCostCapUsd - nextActualCostUsd).toFixed(6), resultClass: finalResultClass, status: finalTaskStatus, queuedAt: canScheduleRetry ? new Date() : task.queuedAt, completedAt, updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
     if (canScheduleRetry) {
       await tx.insert(taskAttempts).values({
@@ -1341,7 +1369,7 @@ export async function recordTaskAttemptExecution(input: {
       const circuitOpenUntil = retryNotBefore ?? new Date(Date.now() + 5 * 60 * 1_000);
       await tx.update(providerConnections).set({ connectionState: "degraded", circuitOpenUntil, circuitReason: failureReason, updatedAt: new Date() }).where(eq(providerConnections.id, connection.id));
     }
-    await tx.insert(usageEvents).values({ workspaceId: input.workspaceId, providerConnectionId: connection?.id, provider: attempt.provider ?? "opencode_go", modelId: input.actualModelId, tokens: { inputTokens: input.inputTokens, outputTokens: input.outputTokens, cacheReadTokens: input.cacheReadTokens, cacheWriteTokens: input.cacheWriteTokens }, estimatedCostUsd: attempt.estimatedCostUsd, actualCostUsd: input.actualCostUsd.toFixed(6), budgetWindow: "five_hour", costUnit: "USD", costBasis: "mixed", source: "task_attempt", occurredAt: new Date(), externalRef: `attempt:${attempt.id}:settled` });
+    await tx.insert(usageEvents).values({ workspaceId: input.workspaceId, providerConnectionId: connection?.id, modelRegistryId: attempt.modelRegistryId, provider: attempt.provider ?? "opencode_go", modelId: input.actualModelId, tokens: tokenSnapshot, estimatedCostUsd: attempt.estimatedCostUsd, actualCostUsd: input.actualCostUsd.toFixed(6), budgetWindow: "five_hour", costUnit: "USD", costBasis: "mixed", source: "task_attempt", occurredAt: new Date(), externalRef: `attempt:${attempt.id}:settled` });
     return { taskStatus: finalTaskStatus, resultClass: finalResultClass, reservationStatus, failurePolicy, failureExecutionPlan, retryScheduledAt: retryNotBefore };
   });
   await refreshWorkspaceBudgets(input.workspaceId);
