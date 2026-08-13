@@ -101,11 +101,14 @@ export const workspaceInvites = mysqlTable("workspace_invites", {
   email: varchar("email", { length: 320 }).notNull(),
   role: mysqlEnum("inviteRole", ["admin", "researcher", "reviewer", "viewer"]).default("researcher").notNull(),
   status: mysqlEnum("inviteStatus", ["pending", "accepted", "revoked", "expired"]).default("pending").notNull(),
+  token: varchar("token", { length: 96 }),
   invitedByUserId: int("invitedByUserId").notNull().references(() => users.id),
+  acceptedByUserId: int("acceptedByUserId").references(() => users.id, { onDelete: "set null" }),
+  acceptedAt: timestamp("acceptedAt"),
   expiresAt: timestamp("expiresAt").notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-}, table => [index("workspace_invites_workspace_idx").on(table.workspaceId)]);
+}, table => [index("workspace_invites_workspace_idx").on(table.workspaceId), uniqueIndex("workspace_invites_token_unique").on(table.token)]);
 
 /** Metadata only; credentials remain in server-side secrets and are never stored in this table. */
 export const providerConnections = mysqlTable("provider_connections", {
@@ -171,9 +174,15 @@ export const modelRegistry = mysqlTable("model_registry", {
   maxContextTokens: int("maxContextTokens").default(0).notNull(),
   capability: json("capability").$type<CapabilityMatrix>().notNull(),
   source: mysqlEnum("modelSource", ["provider_registry", "workspace_policy"]).default("provider_registry").notNull(),
+  pricingVersion: varchar("pricingVersion", { length: 64 }).default("workspace-policy-v1").notNull(),
+  capabilityVersion: varchar("capabilityVersion", { length: 64 }).default("workspace-policy-v1").notNull(),
+  effectiveFrom: timestamp("effectiveFrom").defaultNow().notNull(),
+  effectiveUntil: timestamp("effectiveUntil"),
+  metadataVerifiedAt: timestamp("metadataVerifiedAt"),
+  metadataSourceUrl: varchar("metadataSourceUrl", { length: 512 }),
   isActive: boolean("isActive").default(true).notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-}, table => [uniqueIndex("model_registry_provider_model_unique").on(table.provider, table.modelId)]);
+}, table => [index("model_registry_provider_model_idx").on(table.provider, table.modelId)]);
 
 export const usageImportBatches = mysqlTable("usage_import_batches", {
   id: int("id").autoincrement().primaryKey(),

@@ -63,6 +63,29 @@ const OPEN_CODE_MODELS: ModelSeed[] = [
   { modelId: "minimax-m3", displayName: "MiniMax M3", input: "0.30", output: "1.20", cacheRead: "0.060", scarcity: "0.350", concurrency: 4, capability: capability({ code: 7, reasoning: 7, speed: 8, reliability: 7 }) },
 ];
 
+const OPENCODE_GO_DOCS_URL = "https://opencode.ai/docs/go/";
+const OPENCODE_GO_POLICY_VERSION = "opencode-go-policy-2026-08-13";
+
+export function needsNewModelVersion(current: {
+  inputPerMillionUsd: string;
+  outputPerMillionUsd: string;
+  cacheReadPerMillionUsd: string | null;
+  scarcityFactor: string;
+  maxConcurrency: number;
+  capability: CapabilityMatrix;
+  pricingVersion: string;
+  capabilityVersion: string;
+}, desired: ModelSeed) {
+  return current.inputPerMillionUsd !== desired.input
+    || current.outputPerMillionUsd !== desired.output
+    || (current.cacheReadPerMillionUsd ?? undefined) !== desired.cacheRead
+    || current.scarcityFactor !== desired.scarcity
+    || current.maxConcurrency !== desired.concurrency
+    || JSON.stringify(current.capability) !== JSON.stringify(desired.capability)
+    || current.pricingVersion !== OPENCODE_GO_POLICY_VERSION
+    || current.capabilityVersion !== OPENCODE_GO_POLICY_VERSION;
+}
+
 const PHASE_RESERVE_RATIO = {
   development: 0.1,
   paper: 0.2,
@@ -478,6 +501,27 @@ async function seedWorkspaceDefaults(workspaceId: number) {
   }
 
   for (const model of OPEN_CODE_MODELS) {
+    const verifiedAt = new Date();
+    const activeVersion = (await db.select().from(modelRegistry).where(and(
+      eq(modelRegistry.provider, "opencode_go"),
+      eq(modelRegistry.modelId, model.modelId),
+      eq(modelRegistry.isActive, true),
+    )).limit(1))[0];
+    if (activeVersion && !needsNewModelVersion(activeVersion, model)) {
+      await db.update(modelRegistry).set({
+        metadataVerifiedAt: verifiedAt,
+        metadataSourceUrl: OPENCODE_GO_DOCS_URL,
+        updatedAt: verifiedAt,
+      }).where(eq(modelRegistry.id, activeVersion.id));
+      continue;
+    }
+    if (activeVersion) {
+      await db.update(modelRegistry).set({
+        isActive: false,
+        effectiveUntil: verifiedAt,
+        updatedAt: verifiedAt,
+      }).where(eq(modelRegistry.id, activeVersion.id));
+    }
     await db.insert(modelRegistry).values({
       provider: "opencode_go",
       modelId: model.modelId,
@@ -489,7 +533,12 @@ async function seedWorkspaceDefaults(workspaceId: number) {
       maxConcurrency: model.concurrency,
       capability: model.capability,
       source: "workspace_policy",
-    }).onDuplicateKeyUpdate({ set: { displayName: model.displayName, capability: model.capability, scarcityFactor: model.scarcity, maxConcurrency: model.concurrency, updatedAt: new Date() } });
+      pricingVersion: OPENCODE_GO_POLICY_VERSION,
+      capabilityVersion: OPENCODE_GO_POLICY_VERSION,
+      metadataVerifiedAt: verifiedAt,
+      metadataSourceUrl: OPENCODE_GO_DOCS_URL,
+      effectiveFrom: verifiedAt,
+    });
   }
 
   await db.insert(schedulerSettings).values({ workspaceId }).onDuplicateKeyUpdate({ set: { updatedAt: new Date() } });
@@ -631,7 +680,7 @@ export async function saveUsageImport(input: {
     if (!stored) throw new Error("对象存储未返回导入文件引用。");
     const connections = await db.select().from(providerConnections).where(eq(providerConnections.workspaceId, input.workspaceId));
     const connectionByProvider = new Map(connections.map(connection => [connection.provider, connection]));
-    const models = await db.select().from(modelRegistry);
+    const models = await db.select().from(modelRegistry).where(eq(modelRegistry.isActive, true));
     const modelByProviderAndId = new Map(models.map(model => [`${model.provider}:${model.modelId}`, model]));
     const batchId = await db.transaction(async tx => {
       let createdBatchId = duplicate?.status === "failed" ? duplicate.id : undefined;

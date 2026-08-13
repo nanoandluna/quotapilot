@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getReservationKind, parseUsageImport, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels } from "./quotaService";
+import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getReservationKind, needsNewModelVersion, parseUsageImport, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels } from "./quotaService";
 
 describe("QuotaPilot V2 budget engine", () => {
   it("enters drain protection when the conservative burn rate exhausts budget before reset", () => {
@@ -82,6 +82,13 @@ describe("QuotaPilot V2 budget engine", () => {
       .toBe("2026-08-14T00:00:00.000Z");
     expect(resolveBudgetResetAt({ window: "weekly", policy: "provider_reported", resetAt: new Date("2026-08-10T00:00:00.000Z"), providerReportedResetAt: new Date("2026-08-15T03:00:00.000Z"), now }).toISOString())
       .toBe("2026-08-15T03:00:00.000Z");
+  });
+
+  it("creates a new model version only when routing-relevant policy metadata changes", () => {
+    const desired = { modelId: "sample", displayName: "Sample", input: "0.2", output: "0.4", cacheRead: "0.02", scarcity: "0.5", concurrency: 2, capability: { code: 8, reasoning: 8, longContext: 8, vision: 1, toolUse: 8, chinese: 8, research: 8, agent: 8, speed: 8, reliability: 8 } };
+    const current = { inputPerMillionUsd: "0.2", outputPerMillionUsd: "0.4", cacheReadPerMillionUsd: "0.02", scarcityFactor: "0.5", maxConcurrency: 2, capability: desired.capability, pricingVersion: "opencode-go-policy-2026-08-13", capabilityVersion: "opencode-go-policy-2026-08-13" };
+    expect(needsNewModelVersion(current, desired)).toBe(false);
+    expect(needsNewModelVersion({ ...current, maxConcurrency: 1 }, desired)).toBe(true);
   });
 
   it("filters models that cannot meet research requirements before ranking cost and scarcity", () => {

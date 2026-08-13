@@ -1,5 +1,6 @@
 import { TRPCError } from "@trpc/server";
 import { and, desc, eq, isNull } from "drizzle-orm";
+import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { budgetAlerts, modelRegistry, providerBudgets, providerConnections, researchTasks, routeDecisions, taskAttempts, workspaceInvites, workspaceMembers } from "../../drizzle/schema";
 import { getDb } from "../db";
@@ -184,8 +185,35 @@ export const quotaRouter = router({
     const db = await getDb();
     if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const result = await db.insert(workspaceInvites).values({ workspaceId: input.workspaceId, email: input.email, role: input.role, invitedByUserId: ctx.user.id, expiresAt });
-    return { inviteId: Number(result[0].insertId), expiresAt, delivery: "pending_manual_delivery" as const };
+    const token = randomBytes(24).toString("base64url");
+    const result = await db.insert(workspaceInvites).values({ workspaceId: input.workspaceId, email: input.email.trim().toLowerCase(), role: input.role, token, invitedByUserId: ctx.user.id, expiresAt });
+    return { inviteId: Number(result[0].insertId), token, expiresAt, delivery: "pending_manual_delivery" as const };
+  }),
+  acceptInvite: protectedProcedure.input(z.object({ token: z.string().min(20).max(96) })).mutation(async ({ ctx, input }) => {
+    const db = await getDb();
+    if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+    const userEmail = ctx.user.email;
+    if (!userEmail) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "当前账户没有可验证的邮箱，无法接受工作区邀请。" });
+    return db.transaction(async tx => {
+      const invite = (await tx.select().from(workspaceInvites).where(eq(workspaceInvites.token, input.token)).limit(1))[0];
+      if (!invite) throw new TRPCError({ code: "NOT_FOUND", message: "邀请令牌不存在。" });
+      if (invite.status !== "pending") throw new TRPCError({ code: "CONFLICT", message: "该邀请已被处理、撤销或失效。" });
+      if (invite.expiresAt <= new Date()) {
+        await tx.update(workspaceInvites).set({ status: "expired", updatedAt: new Date() }).where(and(eq(workspaceInvites.id, invite.id), eq(workspaceInvites.status, "pending")));
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "该邀请已过期。" });
+      }
+      if (invite.email.toLowerCase() !== userEmail.toLowerCase()) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "邀请仅可由受邀邮箱对应的账户接受。" });
+      }
+      const acceptedAt = new Date();
+      const consumed = await tx.update(workspaceInvites).set({ status: "accepted", acceptedByUserId: ctx.user.id, acceptedAt, updatedAt: acceptedAt }).where(and(
+        eq(workspaceInvites.id, invite.id),
+        eq(workspaceInvites.status, "pending"),
+      ));
+      if (consumed[0].affectedRows !== 1) throw new TRPCError({ code: "CONFLICT", message: "邀请已被并发接受。" });
+      await tx.insert(workspaceMembers).values({ workspaceId: invite.workspaceId, userId: ctx.user.id, role: invite.role }).onDuplicateKeyUpdate({ set: { updatedAt: acceptedAt } });
+      return { workspaceId: invite.workspaceId, role: invite.role, acceptedAt };
+    });
   }),
   changeMemberRole: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), memberUserId: z.number().int().positive(), role: memberRoleSchema })).mutation(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id, "owner");

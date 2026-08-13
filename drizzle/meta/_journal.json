@@ -64,6 +64,27 @@
       "when": 1786623156160,
       "tag": "0008_stormy_wild_pack",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "5",
+      "when": 1786624184424,
+      "tag": "0009_fancy_gunslinger",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "5",
+      "when": 1786624306258,
+      "tag": "0010_wooden_bushwacker",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "5",
+      "when": 1786624459991,
+      "tag": "0011_clammy_beast",
+      "breakpoints": true
     }
   ]
 }

@@ -80,4 +80,28 @@ describe("QuotaPilot V2 route decision state machine", () => {
 
     expect(transaction.update).toHaveBeenCalledTimes(1);
   });
+
+  it("accepts a pending invite only for the invited email and binds the member transactionally", async () => {
+    const transaction = {
+      select: vi.fn(() => selectRows([{
+        id: 55,
+        token: "abcdefghijklmnopqrstuvwx",
+        email: "owner@example.test",
+        role: "researcher",
+        status: "pending",
+        workspaceId: 7,
+        expiresAt: new Date(Date.now() + 60_000),
+      }])),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+      insert: vi.fn(() => ({ values: vi.fn(() => ({ onDuplicateKeyUpdate: async () => undefined })) })),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: vi.fn((work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)) });
+
+    const caller = quotaRouter.createCaller(authenticatedContext());
+    const result = await caller.acceptInvite({ token: "abcdefghijklmnopqrstuvwx" });
+
+    expect(result).toMatchObject({ workspaceId: 7, role: "researcher" });
+    expect(transaction.update).toHaveBeenCalledTimes(1);
+    expect(transaction.insert).toHaveBeenCalledTimes(1);
+  });
 });

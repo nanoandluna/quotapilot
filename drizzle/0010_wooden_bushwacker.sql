@@ -1,0 +1,2 @@
+ALTER TABLE `model_registry` DROP INDEX `model_registry_provider_model_unique`;--> statement-breakpoint
+CREATE INDEX `model_registry_provider_model_idx` ON `model_registry` (`registryProvider`,`modelId`);
