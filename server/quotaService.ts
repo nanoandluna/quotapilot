@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, isNull, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { createHash } from "node:crypto";
 import {
@@ -16,6 +16,7 @@ import {
   workspaceMembers,
   workspaces,
   type CapabilityMatrix,
+  type RoutePlanSnapshot,
   type TaskRequirements,
   type UsageTokenPayload,
 } from "../drizzle/schema";
@@ -78,6 +79,27 @@ const ROLE_WEIGHT: Record<WorkspaceRole, number> = {
 
 export const asNumber = (value: string | number | null | undefined): number => Number(value ?? 0);
 
+function budgetWindowMs(window: "five_hour" | "daily" | "weekly" | "monthly") {
+  return window === "five_hour" ? 5 * 3_600_000 : window === "weekly" ? 7 * 24 * 3_600_000 : window === "monthly" ? 30 * 24 * 3_600_000 : 24 * 3_600_000;
+}
+
+export function resolveBudgetResetAt(input: {
+  window: "five_hour" | "daily" | "weekly" | "monthly";
+  policy: "rolling" | "fixed" | "calendar" | "provider_reported";
+  resetAt: Date;
+  providerReportedResetAt?: Date | null;
+  now?: Date;
+}) {
+  const now = input.now ?? new Date();
+  if (input.policy === "provider_reported" && input.providerReportedResetAt && input.providerReportedResetAt > now) return input.providerReportedResetAt;
+  if (input.resetAt > now) return input.resetAt;
+  const windowMs = budgetWindowMs(input.window);
+  if (input.policy === "rolling") return new Date(now.getTime() + windowMs);
+  let next = new Date(input.resetAt);
+  while (next <= now) next = new Date(next.getTime() + windowMs);
+  return next;
+}
+
 export function calculateBudgetState(input: {
   limitUsd: number;
   consumedUsd: number;
@@ -121,14 +143,45 @@ export function getAdmissionDecision(input: {
   return "ADMIT";
 }
 
+export function getReservationKind(priority: "P0" | "P1" | "P2" | "P3"): "hard" | "soft" | undefined {
+  if (priority === "P0" || priority === "P1") return "hard";
+  if (priority === "P2") return "soft";
+  return undefined;
+}
+
 export type RoutingModel = {
+  provider?: "opencode_go" | "openai_api" | "local";
   modelId: string;
   displayName: string;
   inputPerMillionUsd: number;
   outputPerMillionUsd: number;
   scarcityFactor: number;
   maxConcurrency: number;
+  activeConcurrency?: number;
+  maxContextTokens?: number;
   capability: CapabilityMatrix;
+};
+
+export type RouteMode = "strict" | "balanced" | "emergency";
+
+export type ProviderRouteContext = {
+  provider: "opencode_go" | "openai_api" | "local";
+  availableUsd?: number;
+  connectionState?: "pending_configuration" | "connected" | "degraded" | "error" | "disabled";
+  secretState?: "not_configured" | "configured";
+};
+
+export type TaskRoutingResolution = {
+  candidates: Array<RoutingModel & { score: number; reason: string }>;
+  recommendedModelId?: string;
+  blockedByCapability: boolean;
+  reason: string;
+};
+
+export type UnifiedRoutePlan = TaskRoutingResolution & {
+  selectedProvider?: "opencode_go" | "openai_api" | "local";
+  blockedByBudget: boolean;
+  routePlan: RoutePlanSnapshot;
 };
 
 export function scoreCandidateModels(requirements: TaskRequirements, models: RoutingModel[]) {
@@ -137,6 +190,7 @@ export function scoreCandidateModels(requirements: TaskRequirements, models: Rou
     .filter(model => model.maxConcurrency > 0)
     .filter(model => !requirements.requiresVision || model.capability.vision > 0)
     .filter(model => !requirements.requiresToolUse || model.capability.toolUse > 0)
+    .filter(model => !requirements.maxContextTokens || (model.maxContextTokens ?? 0) >= requirements.maxContextTokens)
     .filter(model => requiredCapabilities.every(([key, required]) => model.capability[key] >= required))
     .map(model => {
       const capabilityFit = requiredCapabilities.length
@@ -150,12 +204,112 @@ export function scoreCandidateModels(requirements: TaskRequirements, models: Rou
     .sort((left, right) => right.score - left.score);
 }
 
-export function resolveTaskRouting(requirements: TaskRequirements, models: RoutingModel[], requestedModelId?: string) {
+export function resolveTaskRouting(
+  requirements: TaskRequirements,
+  models: RoutingModel[],
+  input: { routeMode: RouteMode; requestedModelId?: string },
+): TaskRoutingResolution {
   const candidates = scoreCandidateModels(requirements, models);
+  const requestedCandidate = input.requestedModelId
+    ? candidates.find(candidate => candidate.modelId === input.requestedModelId)
+    : undefined;
+
+  if (input.routeMode === "strict") {
+    if (!input.requestedModelId) {
+      return { candidates, blockedByCapability: true, reason: "严格模式必须指定 requested model；系统不会自行选择替代模型。" };
+    }
+    if (!requestedCandidate) {
+      return { candidates, recommendedModelId: input.requestedModelId, blockedByCapability: true, reason: "指定模型未激活、并发不可用或不满足任务能力硬约束；严格模式禁止自动替换。" };
+    }
+    return { candidates: [requestedCandidate], recommendedModelId: requestedCandidate.modelId, blockedByCapability: false, reason: "严格模式保留能力合格的指定模型。" };
+  }
+
+  if (input.routeMode === "balanced" && requestedCandidate) {
+    return { candidates, recommendedModelId: requestedCandidate.modelId, blockedByCapability: false, reason: "平衡模式优先采用能力合格的指定模型；若后续配额或连接校验失败，可生成替代 Route Plan。" };
+  }
+
   return {
     candidates,
-    recommendedModelId: candidates[0]?.modelId ?? requestedModelId,
+    recommendedModelId: candidates[0]?.modelId ?? input.requestedModelId,
     blockedByCapability: candidates.length === 0,
+    reason: candidates.length === 0 ? "没有模型满足任务能力硬约束。" : input.routeMode === "emergency" ? "应急模式按能力、可靠性、成本与稀缺性选择当前最优候选。" : "平衡模式未找到可用指定模型，改为选择当前最优候选。",
+  };
+}
+
+export function buildUnifiedRoutePlan(input: {
+  requirements: TaskRequirements;
+  models: Array<RoutingModel & { provider?: "opencode_go" | "openai_api" | "local" }>;
+  routeMode: RouteMode;
+  requestedModelId?: string;
+  estimatedCostUsd: number;
+  providerContexts: ProviderRouteContext[];
+}): UnifiedRoutePlan {
+  const base = resolveTaskRouting(input.requirements, input.models, { routeMode: input.routeMode, requestedModelId: input.requestedModelId });
+  const contextByProvider = new Map(input.providerContexts.map(context => [context.provider, context]));
+  const scoredByModelId = new Map(base.candidates.map(candidate => [candidate.modelId, candidate]));
+  const candidates = base.candidates.map(candidate => {
+    const provider = candidate.provider ?? "opencode_go";
+    const context = contextByProvider.get(provider);
+    const hasBudget = typeof context?.availableUsd === "number" && context.availableUsd >= input.estimatedCostUsd;
+    const reasons = [candidate.reason];
+    if (!context) reasons.push("未发现 provider 五小时预算上下文。");
+    else if (!hasBudget) reasons.push(`provider 当前可用额度不足：${(context.availableUsd ?? 0).toFixed(4)} USD。`);
+    if (context && context.secretState !== "configured") reasons.push("provider 凭据尚未配置；该计划只能人工执行或导入结算。");
+    if (context && context.connectionState !== "connected") reasons.push(`provider 连接状态为 ${context.connectionState ?? "unknown"}。`);
+    return { candidate, provider, hasBudget, reasons };
+  });
+  const eligible = candidates.filter(candidate => candidate.hasBudget);
+  const requested = input.requestedModelId ? candidates.find(candidate => candidate.candidate.modelId === input.requestedModelId) : undefined;
+  let selected: (typeof candidates)[number] | undefined = eligible[0];
+  let reason = base.reason;
+  let blockedByCapability = base.blockedByCapability;
+  let blockedByBudget = false;
+
+  if (input.routeMode === "strict") {
+    selected = requested?.hasBudget ? requested : undefined;
+    if (!requested) blockedByCapability = true;
+    if (requested && !requested.hasBudget) blockedByBudget = true;
+    if (blockedByBudget) reason = "严格模式指定模型满足能力要求，但其 provider 额度不足；禁止自动换模。";
+  } else if (input.routeMode === "balanced" && requested?.hasBudget) {
+    selected = requested;
+  } else if (eligible.length === 0 && !blockedByCapability) {
+    selected = undefined;
+    blockedByBudget = true;
+    reason = "存在能力合格模型，但没有任何候选 provider 具备覆盖本任务的共享可用额度。";
+  }
+
+  const routePlan: RoutePlanSnapshot = {
+    routeMode: input.routeMode,
+    requestedModelId: input.requestedModelId,
+    selectedModelId: selected?.candidate.modelId,
+    budgetWindow: "five_hour",
+    candidates: input.models.map(model => {
+      const scored = scoredByModelId.get(model.modelId);
+      const candidate = candidates.find(item => item.candidate.modelId === model.modelId);
+      const provider = model.provider ?? "opencode_go";
+      return {
+        modelId: model.modelId,
+        provider,
+        score: scored?.score ?? 0,
+        eligible: Boolean(candidate?.hasBudget),
+        reasons: candidate?.reasons ?? [
+          model.maxConcurrency <= (model.activeConcurrency ?? 0)
+            ? `模型并发已满：${model.activeConcurrency}/${model.maxConcurrency}。`
+            : "未满足任务能力硬约束、上下文容量或并发条件。",
+        ],
+      };
+    }),
+    generatedAt: new Date().toISOString(),
+  };
+
+  return {
+    candidates: base.candidates,
+    recommendedModelId: selected?.candidate.modelId ?? base.recommendedModelId,
+    selectedProvider: selected?.provider,
+    blockedByCapability,
+    blockedByBudget,
+    reason,
+    routePlan,
   };
 }
 
@@ -368,11 +522,26 @@ export async function refreshWorkspaceBudgets(workspaceId: number) {
   const now = new Date();
 
   for (const budget of budgets) {
-    const windowMs = budget.window === "five_hour" ? 5 * 3_600_000 : budget.window === "weekly" ? 7 * 24 * 3_600_000 : budget.window === "monthly" ? 30 * 24 * 3_600_000 : 24 * 3_600_000;
+    const resetAt = resolveBudgetResetAt({
+      window: budget.window,
+      policy: budget.resetPolicy,
+      resetAt: budget.resetAt,
+      providerReportedResetAt: budget.providerReportedResetAt,
+      now,
+    });
+    if (resetAt.getTime() !== budget.resetAt.getTime()) {
+      await db.update(providerBudgets).set({ resetAt, updatedAt: now }).where(eq(providerBudgets.id, budget.id));
+    }
+    await db.update(budgetReservations).set({ status: "RELEASED", updatedAt: now }).where(and(
+      eq(budgetReservations.providerBudgetId, budget.id),
+      eq(budgetReservations.status, "RESERVED"),
+      lte(budgetReservations.expiresAt, now),
+    ));
+    const windowMs = budgetWindowMs(budget.window);
     const start = new Date(now.getTime() - windowMs);
     const events = await db.select().from(usageEvents).where(and(eq(usageEvents.workspaceId, workspaceId), eq(usageEvents.providerConnectionId, budget.providerConnectionId), gte(usageEvents.occurredAt, start)));
     const consumed = events.reduce((sum, event) => sum + asNumber(event.actualCostUsd ?? event.estimatedCostUsd), 0);
-    const activeReservations = await db.select().from(budgetReservations).where(and(eq(budgetReservations.providerBudgetId, budget.id), eq(budgetReservations.status, "RESERVED")));
+    const activeReservations = await db.select().from(budgetReservations).where(and(eq(budgetReservations.providerBudgetId, budget.id), eq(budgetReservations.status, "RESERVED"), eq(budgetReservations.reservationKind, "hard")));
     const reserved = activeReservations.reduce((sum, reservation) => sum + asNumber(reservation.amountUsd), 0);
     const p0p1Tasks = await db.select().from(researchTasks).where(and(eq(researchTasks.workspaceId, workspaceId), lte(researchTasks.priority, "P1")));
     const commitment = p0p1Tasks.filter(task => ["queued", "reserved", "running"].includes(task.status)).reduce((sum, task) => sum + asNumber(task.estimatedCostUsd), 0);
@@ -383,7 +552,7 @@ export async function refreshWorkspaceBudgets(workspaceId: number) {
     const phaseFloor = asNumber(budget.limitUsd) * PHASE_RESERVE_RATIO[workspace.researchPhase];
     const burnRiskBuffer = Math.min(asNumber(budget.limitUsd) * 0.15, Math.max(burn15m, burn1h, burn5h) * 0.5);
     const dynamicReserve = Math.max(phaseFloor, commitment) + burnRiskBuffer;
-    const state = calculateBudgetState({ limitUsd: asNumber(budget.limitUsd), consumedUsd: consumed, reservedUsd: reserved, dynamicReserveUsd: dynamicReserve, burnRates: [burn15m, burn1h, burn5h], resetAt: budget.resetAt, now });
+    const state = calculateBudgetState({ limitUsd: asNumber(budget.limitUsd), consumedUsd: consumed, reservedUsd: reserved, dynamicReserveUsd: dynamicReserve, burnRates: [burn15m, burn1h, burn5h], resetAt, now });
     await db.update(providerBudgets).set({
       consumedUsd: consumed.toFixed(4),
       reservedUsd: reserved.toFixed(4),
@@ -406,7 +575,7 @@ export async function refreshWorkspaceBudgets(workspaceId: number) {
         message: `可用余额 ${state.availableUsd.toFixed(4)} USD；动态保护仓 ${dynamicReserve.toFixed(4)} USD。`,
       });
     }
-    if (state.forecastExhaustionAt && state.forecastExhaustionAt.getTime() < budget.resetAt.getTime()) {
+    if (state.forecastExhaustionAt && state.forecastExhaustionAt.getTime() < resetAt.getTime()) {
       await createUnacknowledgedAlert({
         workspaceId,
         providerBudgetId: budget.id,
@@ -569,24 +738,56 @@ export async function reserveTaskBudget(input: {
 }) {
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
-  const routingModels = (await db.select().from(modelRegistry).where(eq(modelRegistry.isActive, true))).map(model => ({
+  await refreshWorkspaceBudgets(input.workspaceId);
+  const [models, connections, budgets, runningAttempts] = await Promise.all([
+    db.select().from(modelRegistry).where(eq(modelRegistry.isActive, true)),
+    db.select().from(providerConnections).where(eq(providerConnections.workspaceId, input.workspaceId)),
+    db.select().from(providerBudgets).where(and(eq(providerBudgets.workspaceId, input.workspaceId), eq(providerBudgets.window, "five_hour"))),
+    db.select().from(taskAttempts).where(and(eq(taskAttempts.workspaceId, input.workspaceId), eq(taskAttempts.status, "running"))),
+  ]);
+  const activeConcurrencyByModel = new Map<string, number>();
+  for (const attempt of runningAttempts) {
+    const modelId = attempt.actualModelId ?? attempt.requestedModelId;
+    if (modelId) activeConcurrencyByModel.set(modelId, (activeConcurrencyByModel.get(modelId) ?? 0) + 1);
+  }
+  const budgetByConnectionId = new Map(budgets.map(budget => [budget.providerConnectionId, budget]));
+  const providerContexts = connections.map(connection => {
+    const budget = budgetByConnectionId.get(connection.id);
+    return {
+      provider: connection.provider as "opencode_go" | "openai_api" | "local",
+      availableUsd: budget ? asNumber(budget.limitUsd) - asNumber(budget.consumedUsd) - asNumber(budget.reservedUsd) : undefined,
+      connectionState: connection.connectionState,
+      secretState: connection.secretState,
+    };
+  });
+  const routingModels = models.map(model => ({
+    provider: model.provider,
     modelId: model.modelId,
     displayName: model.displayName,
     inputPerMillionUsd: asNumber(model.inputPerMillionUsd),
     outputPerMillionUsd: asNumber(model.outputPerMillionUsd),
     scarcityFactor: asNumber(model.scarcityFactor),
-    maxConcurrency: model.maxConcurrency,
+    maxConcurrency: Math.max(0, model.maxConcurrency - (activeConcurrencyByModel.get(model.modelId) ?? 0)),
+    activeConcurrency: activeConcurrencyByModel.get(model.modelId) ?? 0,
+    maxContextTokens: model.maxContextTokens,
     capability: model.capability,
   }));
-  const routing = resolveTaskRouting(input.requirements, routingModels, input.requestedModelId);
+  const routing = buildUnifiedRoutePlan({
+    requirements: input.requirements,
+    models: routingModels,
+    routeMode: input.routeMode,
+    requestedModelId: input.requestedModelId,
+    estimatedCostUsd: input.estimatedCostUsd,
+    providerContexts,
+  });
   const { candidates, recommendedModelId } = routing;
-  const capabilityBlocked = routing.blockedByCapability;
-  await refreshWorkspaceBudgets(input.workspaceId);
-  const budget = (await db.select().from(providerBudgets).where(and(eq(providerBudgets.workspaceId, input.workspaceId), eq(providerBudgets.window, "five_hour"))).limit(1))[0];
+  const selectedModel = routingModels.find(model => model.modelId === recommendedModelId);
+  const attemptProvider = routing.selectedProvider ?? selectedModel?.provider ?? "opencode_go";
+  const budget = budgets.find(candidate => candidate.providerConnectionId === connections.find(connection => connection.provider === attemptProvider)?.id) ?? budgets[0];
   if (!budget) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "缺少可用于任务预留的五小时共享预算。" });
   const available = asNumber(budget.limitUsd) - asNumber(budget.consumedUsd) - asNumber(budget.reservedUsd);
-  const requiresReservation = input.priority === "P0" || input.priority === "P1";
-  const admission = capabilityBlocked ? "HOLD" as const : getAdmissionDecision({
+  const reservationKind = getReservationKind(input.priority);
+  const admission = routing.blockedByCapability || routing.blockedByBudget ? "HOLD" as const : getAdmissionDecision({
     priority: input.priority,
     routeMode: input.routeMode,
     estimatedCostUsd: input.estimatedCostUsd,
@@ -615,8 +816,9 @@ export async function reserveTaskBudget(input: {
     });
     const taskId = Number(taskResult[0].insertId);
     let effectiveAdmission = admission;
-    let reservationCommitted = false;
-    if (requiresReservation && admission !== "HOLD") {
+    let hardReservationCommitted = false;
+    let softReservationCommitted = false;
+    if (reservationKind === "hard" && admission !== "HOLD") {
       const conditionalReserve = await tx.update(providerBudgets).set({
         reservedUsd: sql`${providerBudgets.reservedUsd} + ${input.estimatedCostUsd.toFixed(6)}`,
         updatedAt: new Date(),
@@ -624,27 +826,40 @@ export async function reserveTaskBudget(input: {
         eq(providerBudgets.id, budget.id),
         sql`${providerBudgets.limitUsd} - ${providerBudgets.consumedUsd} - ${providerBudgets.reservedUsd} >= ${input.estimatedCostUsd.toFixed(6)}`,
       ));
-      reservationCommitted = conditionalReserve[0].affectedRows === 1;
-      if (reservationCommitted) {
+      hardReservationCommitted = conditionalReserve[0].affectedRows === 1;
+      if (hardReservationCommitted) {
         await tx.insert(budgetReservations).values({
           workspaceId: input.workspaceId,
           providerBudgetId: budget.id,
           taskId,
           amountUsd: input.estimatedCostUsd.toFixed(6),
+          reservationKind: "hard",
           status: "RESERVED",
           expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000),
         });
       } else {
         effectiveAdmission = "HOLD";
       }
+    } else if (reservationKind === "soft" && admission !== "HOLD") {
+      await tx.insert(budgetReservations).values({
+        workspaceId: input.workspaceId,
+        providerBudgetId: budget.id,
+        taskId,
+        amountUsd: input.estimatedCostUsd.toFixed(6),
+        reservationKind: "soft",
+        status: "RESERVED",
+        expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+      });
+      softReservationCommitted = true;
     }
-    const decisionDetails = capabilityBlocked
-      ? { reason: "没有模型满足任务的能力硬约束；不能为保持队列而静默降级。", action: "manual_handoff" as const, human: true }
+    const decisionDetails = routing.blockedByCapability || routing.blockedByBudget
+      ? { reason: routing.blockedByBudget ? "没有候选 provider 具备覆盖任务的共享可用额度；不能静默绕过预算。" : "没有模型满足任务的能力硬约束；不能为保持队列而静默降级。", action: "manual_handoff" as const, human: true }
       : describeRouteDecision(effectiveAdmission);
-    const candidateReason = candidates[0]
-      ? `${decisionDetails.reason} 候选模型：${candidates[0].displayName}（评分 ${candidates[0].score}）。`
-      : decisionDetails.reason;
-    const taskStatus = reservationCommitted ? "reserved" : effectiveAdmission === "HOLD" || effectiveAdmission === "MIGRATE" ? "paused" : "queued";
+    const selectedCandidate = candidates.find(candidate => candidate.modelId === recommendedModelId);
+    const candidateReason = selectedCandidate
+      ? `${decisionDetails.reason} ${routing.reason} 候选模型：${selectedCandidate.displayName}（评分 ${selectedCandidate.score}）。`
+      : `${decisionDetails.reason} ${routing.reason}`;
+    const taskStatus = hardReservationCommitted ? "reserved" : effectiveAdmission === "HOLD" || effectiveAdmission === "MIGRATE" ? "paused" : "queued";
     await tx.update(researchTasks).set({ status: taskStatus, admissionDecision: effectiveAdmission, updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
     const attemptResult = await tx.insert(taskAttempts).values({
       workspaceId: input.workspaceId,
@@ -652,7 +867,7 @@ export async function reserveTaskBudget(input: {
       attemptNumber: 1,
       requestedModelId: recommendedModelId,
       actualModelId: recommendedModelId,
-      provider: "opencode_go",
+      provider: attemptProvider,
       quotaState: budget.state,
       resultClass: input.resultClass,
       estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
@@ -670,11 +885,91 @@ export async function reserveTaskBudget(input: {
       reason: candidateReason,
       recommendedAction: decisionDetails.action,
       selectedModelId: recommendedModelId,
+      routePlan: routing.routePlan,
       requiresHumanHandoff: decisionDetails.human,
     });
-    return { taskId, reserved: reservationCommitted, state: reservationCommitted ? "RESERVED" as const : effectiveAdmission === "HOLD" ? "PAUSED" as const : "QUEUED" as const, admission: effectiveAdmission };
+    return {
+      taskId,
+      reserved: hardReservationCommitted,
+      softReserved: softReservationCommitted,
+      reservationKind,
+      state: hardReservationCommitted ? "RESERVED" as const : effectiveAdmission === "HOLD" ? "PAUSED" as const : "QUEUED" as const,
+      admission: effectiveAdmission,
+    };
   });
   await refreshWorkspaceBudgets(input.workspaceId).catch(error => console.error("[QuotaPilot] reservation committed but budget refresh failed", error));
+  return result;
+}
+
+export async function claimTaskForLocalExecution(input: { workspaceId: number; taskId: number }) {
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+  const result = await db.transaction(async tx => {
+    const task = (await tx.select().from(researchTasks).where(and(
+      eq(researchTasks.id, input.taskId),
+      eq(researchTasks.workspaceId, input.workspaceId),
+      inArray(researchTasks.status, ["queued", "reserved"]),
+    )).limit(1))[0];
+    if (!task) throw new TRPCError({ code: "CONFLICT", message: "任务不存在、已被领取或当前状态不可执行。" });
+    const attempt = (await tx.select().from(taskAttempts).where(and(
+      eq(taskAttempts.taskId, task.id),
+      eq(taskAttempts.workspaceId, input.workspaceId),
+      eq(taskAttempts.status, "queued"),
+    )).limit(1))[0];
+    if (!attempt) throw new TRPCError({ code: "CONFLICT", message: "任务没有可领取的 queued attempt。" });
+    const reservation = (await tx.select().from(budgetReservations).where(and(
+      eq(budgetReservations.taskId, task.id),
+      eq(budgetReservations.status, "RESERVED"),
+    )).limit(1))[0];
+    const connection = (await tx.select().from(providerConnections).where(and(
+      eq(providerConnections.workspaceId, input.workspaceId),
+      eq(providerConnections.provider, attempt.provider as "opencode_go" | "openai_api" | "chatgpt_plus_manual" | "local"),
+    )).limit(1))[0];
+    const budget = connection ? (await tx.select().from(providerBudgets).where(and(
+      eq(providerBudgets.providerConnectionId, connection.id),
+      eq(providerBudgets.window, "five_hour"),
+    )).limit(1))[0] : undefined;
+    if (!budget) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "任务模型缺少可执行的五小时共享预算。" });
+
+    let claimKind: "existing_hard" | "soft_upgraded" | "p3_hard" = "existing_hard";
+    if (!reservation || reservation.reservationKind === "soft") {
+      const conditionalReserve = await tx.update(providerBudgets).set({
+        reservedUsd: sql`${providerBudgets.reservedUsd} + ${task.estimatedCostUsd}`,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(providerBudgets.id, budget.id),
+        sql`${providerBudgets.limitUsd} - ${providerBudgets.consumedUsd} - ${providerBudgets.reservedUsd} >= ${task.estimatedCostUsd}`,
+      ));
+      if (conditionalReserve[0].affectedRows !== 1) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "执行前共享额度二次准入失败；任务保持排队且不会超卖预算。" });
+      }
+      if (reservation) {
+        await tx.update(budgetReservations).set({ reservationKind: "hard", expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000), updatedAt: new Date() }).where(and(eq(budgetReservations.id, reservation.id), eq(budgetReservations.reservationKind, "soft")));
+        claimKind = "soft_upgraded";
+      } else {
+        await tx.insert(budgetReservations).values({
+          workspaceId: input.workspaceId,
+          providerBudgetId: budget.id,
+          taskId: task.id,
+          amountUsd: task.estimatedCostUsd,
+          reservationKind: "hard",
+          status: "RESERVED",
+          expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+        });
+        claimKind = "p3_hard";
+      }
+    }
+
+    const taskClaim = await tx.update(researchTasks).set({ status: "running", startedAt: new Date(), updatedAt: new Date() }).where(and(
+      eq(researchTasks.id, task.id),
+      inArray(researchTasks.status, ["queued", "reserved"]),
+    ));
+    if (taskClaim[0].affectedRows !== 1) throw new TRPCError({ code: "CONFLICT", message: "任务已被其他执行者领取。" });
+    const attemptClaim = await tx.update(taskAttempts).set({ status: "running", startedAt: new Date() }).where(and(eq(taskAttempts.id, attempt.id), eq(taskAttempts.status, "queued")));
+    if (attemptClaim[0].affectedRows !== 1) throw new TRPCError({ code: "CONFLICT", message: "attempt 已被其他执行者领取。" });
+    return { taskId: task.id, attemptId: attempt.id, claimKind, provider: attempt.provider ?? "unknown" };
+  });
+  await refreshWorkspaceBudgets(input.workspaceId);
   return result;
 }
 

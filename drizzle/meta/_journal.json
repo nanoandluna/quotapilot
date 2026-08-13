@@ -50,6 +50,20 @@
       "when": 1786612610683,
       "tag": "0006_wealthy_green_goblin",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1786622422193,
+      "tag": "0007_eager_roulette",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "5",
+      "when": 1786623156160,
+      "tag": "0008_stormy_wild_pack",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,1 @@
+ALTER TABLE `budget_reservations` ADD `reservationKind` enum('hard','soft') DEFAULT 'hard' NOT NULL;

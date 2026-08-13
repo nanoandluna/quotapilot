@@ -38,6 +38,23 @@ export type TaskRequirements = Partial<CapabilityMatrix> & {
   maxContextTokens?: number;
 };
 
+export type RoutePlanCandidate = {
+  modelId: string;
+  provider: "opencode_go" | "openai_api" | "local";
+  score: number;
+  eligible: boolean;
+  reasons: string[];
+};
+
+export type RoutePlanSnapshot = {
+  routeMode: "strict" | "balanced" | "emergency";
+  requestedModelId?: string;
+  selectedModelId?: string;
+  budgetWindow: "five_hour";
+  candidates: RoutePlanCandidate[];
+  generatedAt: string;
+};
+
 /** Core user table backing the Manus OAuth flow. */
 export const users = mysqlTable("users", {
   id: int("id").autoincrement().primaryKey(),
@@ -124,6 +141,11 @@ export const providerBudgets = mysqlTable("provider_budgets", {
   burnRate5h: decimal("burnRate5h", { precision: 12, scale: 4 }).default("0").notNull(),
   burnRate24h: decimal("burnRate24h", { precision: 12, scale: 4 }).default("0").notNull(),
   forecastExhaustionAt: timestamp("forecastExhaustionAt"),
+  resetPolicy: mysqlEnum("resetPolicy", ["rolling", "fixed", "calendar", "provider_reported"]).default("rolling").notNull(),
+  windowOrigin: timestamp("windowOrigin"),
+  windowTimezone: varchar("windowTimezone", { length: 64 }).default("UTC").notNull(),
+  providerReportedRemainingUsd: decimal("providerReportedRemainingUsd", { precision: 12, scale: 4 }),
+  providerReportedResetAt: timestamp("providerReportedResetAt"),
   resetAt: timestamp("resetAt").notNull(),
   state: mysqlEnum("budgetState", ["GREEN", "YELLOW", "ORANGE", "DRAIN_PROTECTION", "RED"])
     .default("GREEN")
@@ -146,6 +168,7 @@ export const modelRegistry = mysqlTable("model_registry", {
   cacheWritePerMillionUsd: decimal("cacheWritePerMillionUsd", { precision: 12, scale: 6 }),
   scarcityFactor: decimal("scarcityFactor", { precision: 4, scale: 3 }).default("0.500").notNull(),
   maxConcurrency: int("maxConcurrency").default(1).notNull(),
+  maxContextTokens: int("maxContextTokens").default(0).notNull(),
   capability: json("capability").$type<CapabilityMatrix>().notNull(),
   source: mysqlEnum("modelSource", ["provider_registry", "workspace_policy"]).default("provider_registry").notNull(),
   isActive: boolean("isActive").default(true).notNull(),
@@ -241,6 +264,7 @@ export const budgetReservations = mysqlTable("budget_reservations", {
   providerBudgetId: int("providerBudgetId").notNull().references(() => providerBudgets.id, { onDelete: "cascade" }),
   taskId: int("taskId").notNull().references(() => researchTasks.id, { onDelete: "cascade" }),
   amountUsd: decimal("amountUsd", { precision: 12, scale: 6 }).notNull(),
+  reservationKind: mysqlEnum("reservationKind", ["hard", "soft"]).default("hard").notNull(),
   status: mysqlEnum("reservationStatus", ["AVAILABLE", "RESERVED", "CONSUMED", "RELEASED"])
     .default("AVAILABLE")
     .notNull(),
@@ -296,6 +320,7 @@ export const routeDecisions = mysqlTable("route_decisions", {
   reason: text("reason").notNull(),
   recommendedAction: mysqlEnum("recommendedAction", ["run", "reserve", "migrate", "queue", "hold", "manual_handoff"]).notNull(),
   selectedModelId: varchar("selectedModelId", { length: 160 }),
+  routePlan: json("routePlan").$type<RoutePlanSnapshot>(),
   requiresHumanHandoff: boolean("requiresHumanHandoff").default(false).notNull(),
   actedAt: timestamp("actedAt"),
   actedByUserId: int("actedByUserId").references(() => users.id, { onDelete: "set null" }),
