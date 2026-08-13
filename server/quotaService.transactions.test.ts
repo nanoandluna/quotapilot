@@ -8,7 +8,7 @@ const doubles = vi.hoisted(() => ({
 vi.mock("./db", () => ({ getDb: doubles.getDb }));
 vi.mock("./storage", () => ({ storagePut: doubles.storagePut }));
 
-import { claimInitialHardReservation, claimTaskForLocalExecution, listWorkspaceDashboard, recordTaskAttemptExecution, saveUsageImport } from "./quotaService";
+import { claimInitialHardReservation, claimTaskForLocalExecution, listWorkspaceDashboard, queueTaskRetry, recordTaskAttemptExecution, saveUsageImport } from "./quotaService";
 
 function selectRows<T>(rows: T[]) {
   const query = {
@@ -192,9 +192,94 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     });
 
     expect(result.reservationStatus).toBe(expectedReservationStatus);
+    expect(transactionSets.mock.calls[1]?.[0]).toMatchObject({ actualCostUsd: "0.100000", remainingBudgetUsd: "1.900000" });
     expect(transactionSets.mock.calls[2]?.[0]).toMatchObject({ status: expectedReservationStatus });
     expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ source: "task_attempt", externalRef: "attempt:200:settled" }));
     expect(snapshotValues).toHaveBeenCalledWith(expect.objectContaining({ providerBudgetId: 8, window: "five_hour", limitUsd: "10.0000", state: "GREEN" }));
+  });
+
+  it("blocks a claim when the task remaining budget cannot cover its estimated execution cost", async () => {
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 45, workspaceId: 7, status: "queued", estimatedCostUsd: "0.600000", taskBudgetUsd: "0.800000", cumulativeCostCapUsd: "0.800000", actualCostUsd: "0.000000", remainingBudgetUsd: "0.500000" }],
+        [{ id: 203, taskId: 45, workspaceId: 7, status: "queued", provider: "opencode_go" }],
+        [{ id: 302, taskId: 45, providerBudgetId: 8, reservationKind: "hard", status: "RESERVED" }],
+        [{ id: 5, provider: "opencode_go" }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "12.0000", consumedUsd: "1.0000", reservedUsd: "0.5000" }],
+      ]),
+      update: vi.fn(),
+    };
+    const db = {
+      transaction: vi.fn(async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    await expect(claimTaskForLocalExecution({ workspaceId: 7, taskId: 45 })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(transaction.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects settlement when cumulative actual cost would exceed the task cap", async () => {
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 101, workspaceId: 7, taskBudgetUsd: "0.500000", cumulativeCostCapUsd: "0.500000", actualCostUsd: "0.400000", remainingBudgetUsd: "0.100000", requestedModelId: "deepseek-v4-flash" }],
+        [{ id: 201, status: "running", estimatedCostUsd: "0.100000", provider: "opencode_go" }],
+      ]),
+      update: vi.fn(),
+    };
+    const db = {
+      transaction: vi.fn(async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    await expect(recordTaskAttemptExecution({
+      workspaceId: 7,
+      taskId: 101,
+      attemptId: 201,
+      actualModelId: "deepseek-v4-flash",
+      actualCostUsd: 0.11,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      status: "completed",
+      fallback: false,
+      resultClass: "official",
+    })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(transaction.update).not.toHaveBeenCalled();
+  });
+
+  it("queues one next attempt below the configured limit and rejects retries at the limit", async () => {
+    const attemptValues = vi.fn(async () => [{ insertId: 202 }]);
+    const taskUpdate = vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) }));
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 102, workspaceId: 7, status: "failed", maxAttempts: 2, requestedModelId: "deepseek-v4-flash", resultClass: "official", estimatedCostUsd: "0.100000" }],
+        [{ id: 200, taskId: 102, attemptNumber: 1, provider: "opencode_go", quotaState: "GREEN" }],
+      ]),
+      insert: vi.fn(() => ({ values: attemptValues })),
+      update: taskUpdate,
+    };
+    const db = {
+      transaction: vi.fn(async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    await expect(queueTaskRetry({ workspaceId: 7, taskId: 102 })).resolves.toMatchObject({ taskId: 102, attemptId: 202, attemptNumber: 2 });
+    expect(attemptValues).toHaveBeenCalledWith(expect.objectContaining({ attemptNumber: 2, status: "queued" }));
+
+    const limitedTransaction = {
+      select: sequenceSelect([
+        [{ id: 103, workspaceId: 7, status: "failed", maxAttempts: 1, requestedModelId: "deepseek-v4-flash", resultClass: "official", estimatedCostUsd: "0.100000" }],
+        [{ id: 201, taskId: 103, attemptNumber: 1, provider: "opencode_go", quotaState: "GREEN" }],
+      ]),
+      insert: vi.fn(),
+      update: vi.fn(),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: async (work: (tx: typeof limitedTransaction) => Promise<unknown>) => work(limitedTransaction) });
+
+    await expect(queueTaskRetry({ workspaceId: 7, taskId: 103 })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(limitedTransaction.insert).not.toHaveBeenCalled();
+    expect(limitedTransaction.update).not.toHaveBeenCalled();
   });
 
   it("upgrades a P2 soft reservation only after an execution-time hard budget claim succeeds", async () => {

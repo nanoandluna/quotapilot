@@ -8,6 +8,7 @@ import {
   ensurePersonalWorkspace,
   claimTaskForLocalExecution,
   listWorkspaceDashboard,
+  queueTaskRetry,
   requireWorkspaceRole,
   recordTaskAttemptExecution,
   reserveTaskBudget,
@@ -72,6 +73,7 @@ export const quotaRouter = router({
     resultClass: z.enum(["official", "fallback", "exploratory", "recovery"]),
     estimatedCostUsd: z.number().positive().max(60),
     taskBudgetUsd: z.number().positive().max(100),
+    maxAttempts: z.number().int().min(1).max(10).default(3),
     requestedModelId: z.string().max(160).optional(),
     requirements: taskRequirementsSchema.default({}),
     experimentId: z.string().max(128).optional(),
@@ -101,6 +103,10 @@ export const quotaRouter = router({
   claimTask: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), taskId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
     return claimTaskForLocalExecution(input);
+  }),
+  retryTask: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), taskId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    return queueTaskRetry(input);
   }),
   actOnRouteDecision: protectedProcedure.input(z.object({
     workspaceId: z.number().int().positive(),

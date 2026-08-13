@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getReservationKind, needsNewModelVersion, parseUsageImport, parseUsageImportDetailed, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels, syncWorkspacePolicyModel } from "./quotaService";
+import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getReservationKind, getTaskBudgetAdmission, getTaskRetryAdmission, needsNewModelVersion, parseUsageImport, parseUsageImportDetailed, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels, syncWorkspacePolicyModel } from "./quotaService";
 
 describe("QuotaPilot V2 budget engine", () => {
   it("enters drain protection when the conservative burn rate exhausts budget before reset", () => {
@@ -82,6 +82,22 @@ describe("QuotaPilot V2 budget engine", () => {
     expect(getReservationKind("P1")).toBe("hard");
     expect(getReservationKind("P2")).toBe("soft");
     expect(getReservationKind("P3")).toBeUndefined();
+  });
+
+  it("blocks a task before reservation when its first attempt would exceed the cumulative cost cap", () => {
+    expect(getTaskBudgetAdmission({ estimatedCostUsd: 0.51, taskBudgetUsd: 0.5 })).toEqual({
+      admitted: false,
+      reason: "首轮预计成本超过任务累计成本上限；请提高任务预算或拆分任务。",
+    });
+    expect(getTaskBudgetAdmission({ estimatedCostUsd: 0.5, taskBudgetUsd: 0.5 })).toEqual({ admitted: true, reason: null });
+  });
+
+  it("rejects retry admission once a task reaches its configured maximum attempt count", () => {
+    expect(getTaskRetryAdmission({ attemptCount: 2, maxAttempts: 3 })).toEqual({ admitted: true, reason: null });
+    expect(getTaskRetryAdmission({ attemptCount: 3, maxAttempts: 3 })).toEqual({
+      admitted: false,
+      reason: "任务已达到最大尝试次数，拒绝创建新的 attempt。",
+    });
   });
 
   it("advances expired reset windows according to policy while honoring future provider-reported reset times", () => {

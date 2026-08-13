@@ -149,6 +149,32 @@ const ROLE_WEIGHT: Record<WorkspaceRole, number> = {
 
 export const asNumber = (value: string | number | null | undefined): number => Number(value ?? 0);
 
+function taskCostCapUsd(task: { cumulativeCostCapUsd: string | number | null; taskBudgetUsd: string | number | null; estimatedCostUsd?: string | number | null }) {
+  const explicitCap = asNumber(task.cumulativeCostCapUsd);
+  const taskBudget = asNumber(task.taskBudgetUsd);
+  return explicitCap > 0 ? explicitCap : taskBudget > 0 ? taskBudget : asNumber(task.estimatedCostUsd);
+}
+
+export function getTaskBudgetAdmission(input: { estimatedCostUsd: number; taskBudgetUsd: number }) {
+  if (!Number.isFinite(input.estimatedCostUsd) || input.estimatedCostUsd < 0 || !Number.isFinite(input.taskBudgetUsd) || input.taskBudgetUsd <= 0) {
+    return { admitted: false, reason: "任务预计成本必须为非负数，任务成本上限必须为正数。" } as const;
+  }
+  if (input.estimatedCostUsd > input.taskBudgetUsd) {
+    return { admitted: false, reason: "首轮预计成本超过任务累计成本上限；请提高任务预算或拆分任务。" } as const;
+  }
+  return { admitted: true, reason: null } as const;
+}
+
+export function getTaskRetryAdmission(input: { attemptCount: number; maxAttempts: number }) {
+  if (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1) {
+    return { admitted: false, reason: "任务最大尝试次数必须为至少 1 的整数。" } as const;
+  }
+  if (input.attemptCount >= input.maxAttempts) {
+    return { admitted: false, reason: "任务已达到最大尝试次数，拒绝创建新的 attempt。" } as const;
+  }
+  return { admitted: true, reason: null } as const;
+}
+
 function budgetWindowMs(window: "five_hour" | "daily" | "weekly" | "monthly") {
   return window === "five_hour" ? 5 * 3_600_000 : window === "weekly" ? 7 * 24 * 3_600_000 : window === "monthly" ? 30 * 24 * 3_600_000 : 24 * 3_600_000;
 }
@@ -851,6 +877,7 @@ export async function reserveTaskBudget(input: {
   resultClass: "official" | "fallback" | "exploratory" | "recovery";
   estimatedCostUsd: number;
   taskBudgetUsd: number;
+  maxAttempts?: number;
   requestedModelId?: string;
   requirements: TaskRequirements;
   experimentId?: string;
@@ -858,6 +885,11 @@ export async function reserveTaskBudget(input: {
 }) {
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+  const taskBudgetAdmission = getTaskBudgetAdmission(input);
+  if (!taskBudgetAdmission.admitted) {
+    const code = input.estimatedCostUsd > input.taskBudgetUsd ? "PRECONDITION_FAILED" : "BAD_REQUEST";
+    throw new TRPCError({ code, message: taskBudgetAdmission.reason });
+  }
   await refreshWorkspaceBudgets(input.workspaceId);
   const [models, connections, budgets, runningAttempts] = await Promise.all([
     db.select().from(modelRegistry).where(eq(modelRegistry.isActive, true)),
@@ -929,6 +961,9 @@ export async function reserveTaskBudget(input: {
       requirements: input.requirements,
       estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
       taskBudgetUsd: input.taskBudgetUsd.toFixed(6),
+      cumulativeCostCapUsd: input.taskBudgetUsd.toFixed(6),
+      remainingBudgetUsd: input.taskBudgetUsd.toFixed(6),
+      maxAttempts: input.maxAttempts ?? 3,
       experimentId: input.experimentId,
       runId: input.runId,
       status: "queued",
@@ -1030,10 +1065,7 @@ export async function claimTaskForLocalExecution(input: { workspaceId: number; t
       eq(taskAttempts.status, "queued"),
     )).limit(1))[0];
     if (!attempt) throw new TRPCError({ code: "CONFLICT", message: "任务没有可领取的 queued attempt。" });
-    const reservation = (await tx.select().from(budgetReservations).where(and(
-      eq(budgetReservations.taskId, task.id),
-      eq(budgetReservations.status, "RESERVED"),
-    )).limit(1))[0];
+    const reservation = (await tx.select().from(budgetReservations).where(eq(budgetReservations.taskId, task.id)).limit(1))[0];
     const connection = (await tx.select().from(providerConnections).where(and(
       eq(providerConnections.workspaceId, input.workspaceId),
       eq(providerConnections.provider, attempt.provider as "opencode_go" | "openai_api" | "chatgpt_plus_manual" | "local"),
@@ -1043,9 +1075,15 @@ export async function claimTaskForLocalExecution(input: { workspaceId: number; t
       eq(providerBudgets.window, "five_hour"),
     )).limit(1))[0] : undefined;
     if (!budget) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "任务模型缺少可执行的五小时共享预算。" });
+    const remainingTaskBudget = task.remainingBudgetUsd === null || task.remainingBudgetUsd === undefined
+      ? Math.max(0, taskCostCapUsd(task) - asNumber(task.actualCostUsd))
+      : asNumber(task.remainingBudgetUsd);
+    if (asNumber(task.estimatedCostUsd) > remainingTaskBudget) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "执行前任务成本上限校验失败；预计成本超过任务剩余预算。" });
+    }
 
     let claimKind: "existing_hard" | "soft_upgraded" | "p3_hard" = "existing_hard";
-    if (!reservation || reservation.reservationKind === "soft") {
+    if (!reservation || reservation.reservationKind === "soft" || reservation.status !== "RESERVED") {
       const conditionalReserve = await tx.update(providerBudgets).set({
         reservedUsd: sql`${providerBudgets.reservedUsd} + ${task.estimatedCostUsd}`,
         updatedAt: new Date(),
@@ -1057,8 +1095,8 @@ export async function claimTaskForLocalExecution(input: { workspaceId: number; t
         throw new TRPCError({ code: "PRECONDITION_FAILED", message: "执行前共享额度二次准入失败；任务保持排队且不会超卖预算。" });
       }
       if (reservation) {
-        await tx.update(budgetReservations).set({ reservationKind: "hard", expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000), updatedAt: new Date() }).where(and(eq(budgetReservations.id, reservation.id), eq(budgetReservations.reservationKind, "soft")));
-        claimKind = "soft_upgraded";
+        await tx.update(budgetReservations).set({ amountUsd: task.estimatedCostUsd, reservationKind: "hard", status: "RESERVED", expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000), updatedAt: new Date() }).where(eq(budgetReservations.id, reservation.id));
+        claimKind = reservation.reservationKind === "soft" ? "soft_upgraded" : "p3_hard";
       } else {
         await tx.insert(budgetReservations).values({
           workspaceId: input.workspaceId,
@@ -1103,6 +1141,9 @@ export async function recordTaskAttemptExecution(input: {
 }) {
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+  if (!Number.isFinite(input.actualCostUsd) || input.actualCostUsd < 0) {
+    throw new TRPCError({ code: "BAD_REQUEST", message: "实际成本必须为非负数。" });
+  }
   const settled = await db.transaction(async tx => {
     const task = (await tx.select().from(researchTasks).where(and(eq(researchTasks.id, input.taskId), eq(researchTasks.workspaceId, input.workspaceId))).limit(1))[0];
     const attempt = (await tx.select().from(taskAttempts).where(and(eq(taskAttempts.id, input.attemptId), eq(taskAttempts.taskId, input.taskId), eq(taskAttempts.workspaceId, input.workspaceId))).limit(1))[0];
@@ -1111,23 +1152,63 @@ export async function recordTaskAttemptExecution(input: {
     if ((input.fallback || input.actualModelId !== task.requestedModelId) && input.resultClass === "official") {
       throw new TRPCError({ code: "PRECONDITION_FAILED", message: "模型切换后的 attempt 不能写入 official 结果；请标记为 fallback 或 recovery。" });
     }
-    if (input.actualCostUsd > asNumber(task.taskBudgetUsd)) {
-      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "实际成本超过任务预算，系统拒绝写入完成结果。" });
+    const cumulativeCostCapUsd = taskCostCapUsd(task);
+    const remainingTaskBudget = task.remainingBudgetUsd === null || task.remainingBudgetUsd === undefined
+      ? Math.max(0, cumulativeCostCapUsd - asNumber(task.actualCostUsd))
+      : asNumber(task.remainingBudgetUsd);
+    const nextActualCostUsd = asNumber(task.actualCostUsd) + input.actualCostUsd;
+    if (input.actualCostUsd > remainingTaskBudget || nextActualCostUsd > cumulativeCostCapUsd) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "实际成本超过任务累计成本上限或剩余预算，系统拒绝写入结算。" });
     }
     const finalTaskStatus = input.status === "completed" ? "completed" : input.status === "cancelled" ? "cancelled" : "failed";
     const finalResultClass = input.fallback || input.actualModelId !== task.requestedModelId
       ? input.resultClass === "official" ? "fallback" : input.resultClass
       : input.resultClass;
     await tx.update(taskAttempts).set({ actualModelId: input.actualModelId, fallback: input.fallback || input.actualModelId !== task.requestedModelId, fallbackReason: input.fallback || input.actualModelId !== task.requestedModelId ? input.fallbackReason ?? "manual" : null, resultClass: finalResultClass, status: input.status, actualCostUsd: input.actualCostUsd.toFixed(6), completedAt: new Date() }).where(eq(taskAttempts.id, attempt.id));
-    await tx.update(researchTasks).set({ actualCostUsd: input.actualCostUsd.toFixed(6), resultClass: finalResultClass, status: finalTaskStatus, completedAt: new Date(), updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
+    await tx.update(researchTasks).set({ actualCostUsd: nextActualCostUsd.toFixed(6), remainingBudgetUsd: Math.max(0, cumulativeCostCapUsd - nextActualCostUsd).toFixed(6), resultClass: finalResultClass, status: finalTaskStatus, completedAt: new Date(), updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
     const reservationStatus = input.status === "completed" ? "CONSUMED" : "RELEASED";
     await tx.update(budgetReservations).set({ status: reservationStatus, updatedAt: new Date() }).where(and(eq(budgetReservations.taskId, task.id), eq(budgetReservations.status, "RESERVED")));
-    const connection = (await tx.select().from(providerConnections).where(and(eq(providerConnections.workspaceId, input.workspaceId), eq(providerConnections.provider, "opencode_go"))).limit(1))[0];
-    await tx.insert(usageEvents).values({ workspaceId: input.workspaceId, providerConnectionId: connection?.id, provider: "opencode_go", modelId: input.actualModelId, tokens: { inputTokens: input.inputTokens, outputTokens: input.outputTokens, cacheReadTokens: input.cacheReadTokens, cacheWriteTokens: input.cacheWriteTokens }, estimatedCostUsd: attempt.estimatedCostUsd, actualCostUsd: input.actualCostUsd.toFixed(6), budgetWindow: "five_hour", costUnit: "USD", costBasis: "mixed", source: "task_attempt", occurredAt: new Date(), externalRef: `attempt:${attempt.id}:settled` });
+    const connection = (await tx.select().from(providerConnections).where(and(eq(providerConnections.workspaceId, input.workspaceId), eq(providerConnections.provider, (attempt.provider ?? "opencode_go") as "opencode_go" | "openai_api" | "chatgpt_plus_manual" | "local"))).limit(1))[0];
+    await tx.insert(usageEvents).values({ workspaceId: input.workspaceId, providerConnectionId: connection?.id, provider: attempt.provider ?? "opencode_go", modelId: input.actualModelId, tokens: { inputTokens: input.inputTokens, outputTokens: input.outputTokens, cacheReadTokens: input.cacheReadTokens, cacheWriteTokens: input.cacheWriteTokens }, estimatedCostUsd: attempt.estimatedCostUsd, actualCostUsd: input.actualCostUsd.toFixed(6), budgetWindow: "five_hour", costUnit: "USD", costBasis: "mixed", source: "task_attempt", occurredAt: new Date(), externalRef: `attempt:${attempt.id}:settled` });
     return { taskStatus: finalTaskStatus, resultClass: finalResultClass, reservationStatus };
   });
   await refreshWorkspaceBudgets(input.workspaceId);
   return settled;
+}
+
+export async function queueTaskRetry(input: { workspaceId: number; taskId: number }) {
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+  return db.transaction(async tx => {
+    const task = (await tx.select().from(researchTasks).where(and(
+      eq(researchTasks.id, input.taskId),
+      eq(researchTasks.workspaceId, input.workspaceId),
+      inArray(researchTasks.status, ["failed", "cancelled"]),
+    )).limit(1))[0];
+    if (!task) throw new TRPCError({ code: "CONFLICT", message: "任务当前不可重试；请先完成或取消正在运行的 attempt。" });
+    const attempts = await tx.select().from(taskAttempts).where(and(
+      eq(taskAttempts.taskId, task.id),
+      eq(taskAttempts.workspaceId, input.workspaceId),
+    ));
+    const retryAdmission = getTaskRetryAdmission({ attemptCount: attempts.length, maxAttempts: task.maxAttempts });
+    if (!retryAdmission.admitted) throw new TRPCError({ code: "PRECONDITION_FAILED", message: retryAdmission.reason });
+    const previousAttempt = attempts.reduce((latest, attempt) => attempt.attemptNumber > latest.attemptNumber ? attempt : latest, attempts[0]);
+    const nextAttemptNumber = Math.max(...attempts.map(attempt => attempt.attemptNumber)) + 1;
+    const insertResult = await tx.insert(taskAttempts).values({
+      workspaceId: input.workspaceId,
+      taskId: task.id,
+      attemptNumber: nextAttemptNumber,
+      requestedModelId: task.requestedModelId,
+      actualModelId: task.requestedModelId,
+      provider: previousAttempt?.provider ?? "opencode_go",
+      quotaState: previousAttempt?.quotaState,
+      resultClass: task.resultClass,
+      estimatedCostUsd: task.estimatedCostUsd,
+      status: "queued",
+    });
+    await tx.update(researchTasks).set({ status: "queued", queuedAt: new Date(), completedAt: null, updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
+    return { taskId: task.id, attemptId: Number(insertResult[0].insertId), attemptNumber: nextAttemptNumber };
+  });
 }
 
 export async function listWorkspaceDashboard(workspaceId: number) {
