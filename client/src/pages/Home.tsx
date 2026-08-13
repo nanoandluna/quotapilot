@@ -243,6 +243,8 @@ export default function Home() {
   const selected = TASK_PRESETS.find(item => item.id === selectedPreset) ?? TASK_PRESETS[1];
   const routeModel = useMemo(() => {
     const models = data?.models ?? [];
+    const serverSelected = routeEvaluation?.selectedModelId ? models.find(model => model.modelId === routeEvaluation.selectedModelId) : undefined;
+    if (serverSelected) return serverSelected;
     const requirements = selected.requirements;
     const candidates = models.filter(model => Object.entries(requirements).every(([key, value]) => typeof value !== "number" || Number((model.capability as Record<string, number>)[key] ?? 0) >= value));
     return [...(candidates.length ? candidates : models)].sort((a, b) => {
@@ -250,7 +252,7 @@ export default function Home() {
       const bScore = Number((b.capability as Record<string, number>).reliability ?? 0) * 2 + Number((b.capability as Record<string, number>).code ?? 0) - Number(b.scarcityFactor) * 3;
       return bScore - aScore;
     })[0];
-  }, [data?.models, selected]);
+  }, [data?.models, routeEvaluation?.selectedModelId, selected]);
   const routeSteps = useMemo(() => {
     if (routeEvaluation) return [
       `评估 #${routeEvaluation.evaluationId} 已写入服务端审计记录`,
@@ -264,6 +266,10 @@ export default function Home() {
     if (rateScenario === "context_overflow") return ["CONTEXT_OVERFLOW 已识别", "提取相关文件和函数级上下文", "压缩引用，限制输出长度", "重新评估模型上下文能力后再尝试"]; 
     return ["能力硬约束筛选模型", "核对任务预算与共享窗口可用金额", "核对 P0/P1 预留和模型并发上限", "创建可审计 attempt，不调用真实 provider"]; 
   }, [rateScenario, routeEvaluation]);
+
+  useEffect(() => {
+    setRouteEvaluation(null);
+  }, [mode, priority, rateScenario, selectedPreset]);
 
   useEffect(() => {
     const submitRouteEvaluation = (event: MouseEvent) => {
