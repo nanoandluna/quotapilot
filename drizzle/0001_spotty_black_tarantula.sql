@@ -1,0 +1,1 @@
+ALTER TABLE `task_attempts` ADD `attemptResultClass` enum('official','fallback','exploratory','recovery') DEFAULT 'exploratory' NOT NULL;
