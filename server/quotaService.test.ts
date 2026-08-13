@@ -151,6 +151,24 @@ describe("QuotaPilot V2 budget engine", () => {
     expect(candidates.map(candidate => candidate.modelId)).toEqual(["research"]);
   });
 
+  it("requires P0 candidates to meet higher reliability and reasoning gates before later hard reservation", () => {
+    const models = [
+      { modelId: "lower-reliability", displayName: "Lower reliability", inputPerMillionUsd: 1, outputPerMillionUsd: 1, scarcityFactor: 0.2, maxConcurrency: 2, capability: { code: 8, reasoning: 8, longContext: 8, vision: 0, toolUse: 8, chinese: 8, research: 8, agent: 8, speed: 8, reliability: 7 } },
+      { modelId: "p0-safe", displayName: "P0 safe", inputPerMillionUsd: 2, outputPerMillionUsd: 2, scarcityFactor: 0.3, maxConcurrency: 2, capability: { code: 8, reasoning: 8, longContext: 8, vision: 0, toolUse: 8, chinese: 8, research: 8, agent: 8, speed: 8, reliability: 9 } },
+    ];
+    const plan = buildUnifiedRoutePlan({
+      priority: "P0",
+      requirements: { reasoning: 8 },
+      models,
+      routeMode: "balanced",
+      estimatedCostUsd: 0.1,
+      providerContexts: [{ provider: "opencode_go", availableUsd: 1, connectionState: "connected", secretState: "configured" }],
+    });
+
+    expect(plan.candidates.map(candidate => candidate.modelId)).toEqual(["p0-safe"]);
+    expect(plan.recommendedModelId).toBe("p0-safe");
+  });
+
   it("blocks a task for manual handoff when no model satisfies its capability hard constraints", () => {
     const routing = resolveTaskRouting({ vision: 8, requiresToolUse: true }, [
       { modelId: "text-only", displayName: "Text only", inputPerMillionUsd: 0.1, outputPerMillionUsd: 0.2, scarcityFactor: 0.2, maxConcurrency: 4, capability: { code: 7, reasoning: 7, longContext: 8, vision: 0, toolUse: 8, chinese: 7, research: 7, agent: 6, speed: 10, reliability: 8 } },

@@ -328,22 +328,27 @@ export type UnifiedRoutePlan = TaskRoutingResolution & {
   routePlan: RoutePlanSnapshot;
 };
 
-export function scoreCandidateModels(requirements: TaskRequirements, models: RoutingModel[]) {
+export function scoreCandidateModels(requirements: TaskRequirements, models: RoutingModel[], options?: { priority?: "P0" | "P1" | "P2" | "P3" }) {
   const requiredCapabilities = (Object.entries(requirements) as Array<[keyof TaskRequirements, unknown]>).filter(([key, value]) => key in capability({}) && typeof value === "number" && value > 0) as Array<[keyof CapabilityMatrix, number]>;
+  const p0MinimumCapability = requiredCapabilities.length ? Math.max(...requiredCapabilities.map(([, required]) => required)) : 7;
   return models
     .filter(model => model.maxConcurrency > 0)
     .filter(model => !requirements.requiresVision || model.capability.vision > 0)
     .filter(model => !requirements.requiresToolUse || model.capability.toolUse > 0)
     .filter(model => !requirements.maxContextTokens || (model.maxContextTokens ?? 0) >= requirements.maxContextTokens)
     .filter(model => requiredCapabilities.every(([key, required]) => model.capability[key] >= required))
+    .filter(model => options?.priority !== "P0" || (model.capability.reliability >= 8 && model.capability.reasoning >= Math.min(8, p0MinimumCapability)))
     .map(model => {
       const capabilityFit = requiredCapabilities.length
         ? requiredCapabilities.reduce((total, [key, required]) => total + Math.min(1, model.capability[key] / Math.max(1, required)), 0) / requiredCapabilities.length
         : 0.6;
-      const quality = (capabilityFit * 0.55) + ((model.capability.reliability / 10) * 0.25) + ((model.capability.speed / 10) * 0.1);
+      const availability = Math.min(1, model.maxConcurrency / Math.max(1, model.activeConcurrency ?? 1));
+      const continuity = Math.max(0, 1 - model.scarcityFactor);
+      const quality = (capabilityFit * 0.5) + ((model.capability.reliability / 10) * 0.3) + (availability * 0.1) + (continuity * 0.1);
       const price = model.inputPerMillionUsd + model.outputPerMillionUsd;
-      const score = (quality * 100) - (price * 1.5) - (model.scarcityFactor * 12);
-      return { ...model, score: Number(score.toFixed(3)), reason: `能力满足硬约束；可靠性 ${model.capability.reliability}/10，稀缺性 ${model.scarcityFactor.toFixed(2)}。` };
+      const score = (quality * 100) - (price * 1.25) - (model.scarcityFactor * 10);
+      const p0Reason = options?.priority === "P0" ? "P0 已通过可靠性 ≥8 与推理能力门槛；后续必须通过共享额度原子硬预留。" : "";
+      return { ...model, score: Number(score.toFixed(3)), reason: `能力满足硬约束；可靠性 ${model.capability.reliability}/10，可用并发 ${model.maxConcurrency}，稀缺性 ${model.scarcityFactor.toFixed(2)}。${p0Reason}` };
     })
     .sort((left, right) => right.score - left.score);
 }
@@ -351,9 +356,9 @@ export function scoreCandidateModels(requirements: TaskRequirements, models: Rou
 export function resolveTaskRouting(
   requirements: TaskRequirements,
   models: RoutingModel[],
-  input: { routeMode: RouteMode; requestedModelId?: string },
+  input: { routeMode: RouteMode; requestedModelId?: string; priority?: "P0" | "P1" | "P2" | "P3" },
 ): TaskRoutingResolution {
-  const candidates = scoreCandidateModels(requirements, models);
+  const candidates = scoreCandidateModels(requirements, models, { priority: input.priority });
   const requestedCandidate = input.requestedModelId
     ? candidates.find(candidate => candidate.modelId === input.requestedModelId)
     : undefined;
@@ -383,12 +388,13 @@ export function resolveTaskRouting(
 export function buildUnifiedRoutePlan(input: {
   requirements: TaskRequirements;
   models: Array<RoutingModel & { provider?: "opencode_go" | "openai_api" | "local" }>;
+  priority?: "P0" | "P1" | "P2" | "P3";
   routeMode: RouteMode;
   requestedModelId?: string;
   estimatedCostUsd: number;
   providerContexts: ProviderRouteContext[];
 }): UnifiedRoutePlan {
-  const base = resolveTaskRouting(input.requirements, input.models, { routeMode: input.routeMode, requestedModelId: input.requestedModelId });
+  const base = resolveTaskRouting(input.requirements, input.models, { routeMode: input.routeMode, requestedModelId: input.requestedModelId, priority: input.priority });
   const contextByProvider = new Map(input.providerContexts.map(context => [context.provider, context]));
   const scoredByModelId = new Map(base.candidates.map(candidate => [candidate.modelId, candidate]));
   const candidates = base.candidates.map(candidate => {
@@ -964,6 +970,7 @@ export async function reserveTaskBudget(input: {
   const routing = buildUnifiedRoutePlan({
     requirements: input.requirements,
     models: routingModels,
+    priority: input.priority,
     routeMode: input.routeMode,
     requestedModelId: input.requestedModelId,
     estimatedCostUsd: input.estimatedCostUsd,
@@ -1125,6 +1132,7 @@ export async function evaluateRouteLabPolicy(input: {
     });
   const routing = buildUnifiedRoutePlan({
     requirements: input.requirements,
+    priority: input.priority,
     models: models.map(model => ({
       provider: model.provider,
       modelId: model.modelId,
