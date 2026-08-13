@@ -114,6 +114,22 @@ describe("QuotaPilot V2 route decision state machine", () => {
     }));
   });
 
+  it.each(["none", "rate_limit", "quota_low", "timeout", "context_overflow"] as const)("accepts the %s Route Lab scenario through the protected policy boundary", async scenario => {
+    doubles.evaluateRouteLabPolicy.mockResolvedValue({ evaluationId: 13, decision: "QUEUE", providerCallsDisabled: true });
+    const caller = quotaRouter.createCaller(authenticatedContext());
+
+    await caller.evaluateRouteLab({
+      workspaceId: 7,
+      priority: "P2",
+      routeMode: "balanced",
+      scenario,
+      requirements: { code: 6 },
+      estimatedCostUsd: 0.08,
+    });
+
+    expect(doubles.evaluateRouteLabPolicy).toHaveBeenLastCalledWith(expect.objectContaining({ scenario, workspaceId: 7 }));
+  });
+
   it("binds a manually selected migration candidate to the queued attempt before releasing the task back to queue", async () => {
     const rows = [
       [{ id: 100, workspaceId: 7, taskId: 43, admissionDecision: "MIGRATE", selectedModelId: "deepseek-v4-flash", actedAt: null }],
