@@ -146,6 +146,54 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     expect(db.transaction).not.toHaveBeenCalled();
   });
 
+  it.each(["strict", "balanced", "emergency"] as const)(
+    "blocks provisional settlement from an official formal experiment in %s mode",
+    async routeMode => {
+      const transaction = {
+        select: sequenceSelect([
+          [
+            {
+              id: 100,
+              taskClass: "formal_experiment",
+              resultClass: "official",
+              routeMode,
+              requestedModelId: "deepseek-v4-pro",
+            },
+          ],
+          [{ id: 200, status: "running" }],
+        ]),
+        update: vi.fn(),
+        insert: vi.fn(),
+      };
+      const db = {
+        transaction: vi.fn(
+          async (work: (tx: typeof transaction) => Promise<unknown>) =>
+            work(transaction)
+        ),
+      };
+      doubles.getDb.mockResolvedValue(db);
+
+      await expect(
+        recordTaskAttemptExecution({
+          workspaceId: 7,
+          taskId: 100,
+          attemptId: 200,
+          actualModelId: "deepseek-v4-pro",
+          actualCostUsd: 0,
+          status: "completed",
+          fallback: false,
+          resultClass: "exploratory",
+        })
+      ).rejects.toMatchObject({
+        code: "PRECONDITION_FAILED",
+        message: expect.stringContaining(routeMode),
+      });
+
+      expect(transaction.update).not.toHaveBeenCalled();
+      expect(transaction.insert).not.toHaveBeenCalled();
+    }
+  );
+
   it("records a retryable failed batch when object storage rejects an import", async () => {
     const batchValues = vi.fn(async () => undefined);
     const db = {

@@ -2878,6 +2878,22 @@ export async function recordTaskAttemptExecution(input: {
         code: "CONFLICT",
         message: "该 attempt 已结算，拒绝重复记账。",
       });
+    const isProvisionalResult =
+      input.resultClass === "fallback" ||
+      input.resultClass === "exploratory" ||
+      input.resultClass === "recovery" ||
+      input.fallback ||
+      input.actualModelId !== task.requestedModelId;
+    if (
+      task.taskClass === "formal_experiment" &&
+      task.resultClass === "official" &&
+      isProvisionalResult
+    ) {
+      throw new TRPCError({
+        code: "PRECONDITION_FAILED",
+        message: `${task.routeMode} 模式下，provisional 结果不得写入 official 正式实验；请创建独立的 fallback、exploratory 或 recovery 任务。`,
+      });
+    }
     if (
       (input.fallback || input.actualModelId !== task.requestedModelId) &&
       input.resultClass === "official"
