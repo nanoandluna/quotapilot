@@ -409,6 +409,32 @@ describe("QuotaPilot V2 route decision state machine", () => {
     expect(doubles.reserveTaskBudget).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { admissionDecision: "QUEUE", action: "queue" as const, taskStatus: "queued", expectedStatus: "queued" as const },
+    { admissionDecision: "HOLD", action: "hold" as const, taskStatus: "paused", expectedStatus: "paused" as const },
+    { admissionDecision: "HOLD", action: "manual_handoff" as const, taskStatus: "paused", expectedStatus: "paused" as const },
+  ])("persists $action Route Decision handling with immutable lifecycle events", async ({ admissionDecision, action, taskStatus, expectedStatus }) => {
+    const rows = [
+      [{ id: 88, workspaceId: 7, taskId: 42, attemptId: 12, admissionDecision, selectedModelId: null, actedAt: null }],
+      [{ id: 42, workspaceId: 7, status: taskStatus, admissionDecision, requestedModelId: "deepseek-v4-flash" }],
+    ];
+    const set = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const eventValues = vi.fn(async () => undefined);
+    const transaction = {
+      select: vi.fn(() => selectRows(rows.shift() ?? [])),
+      update: vi.fn(() => ({ set })),
+      insert: vi.fn(() => ({ values: eventValues })),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: vi.fn((work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)) });
+
+    const result = await quotaRouter.createCaller(authenticatedContext()).actOnRouteDecision({ workspaceId: 7, decisionId: 88, action });
+
+    expect(result).toEqual({ ok: true, taskId: 42, status: expectedStatus });
+    expect(set.mock.calls[1]?.[0]).toMatchObject({ status: expectedStatus, admissionDecision });
+    expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ kind: "route_decision", payload: expect.objectContaining({ action }) }));
+    expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ kind: expectedStatus === "queued" ? "task_resumed" : "task_paused", payload: expect.objectContaining({ source: "route_decision", action }) }));
+  });
+
   it("binds a manually selected migration candidate to the queued attempt before releasing the task back to queue", async () => {
     const rows = [
       [
