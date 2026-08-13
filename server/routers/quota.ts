@@ -2,7 +2,7 @@ import { TRPCError } from "@trpc/server";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import { budgetAlerts, modelRegistry, providerBudgets, providerConnections, researchTasks, routeDecisions, taskAttempts, workspaceAuditLogs, workspaceInvites, workspaceMembers } from "../../drizzle/schema";
+import { budgetAlerts, modelRegistry, providerBudgets, providerConnections, researchTasks, routeDecisions, taskAttempts, taskEvents, workspaceAuditLogs, workspaceInvites, workspaceMembers } from "../../drizzle/schema";
 import { getDb } from "../db";
 import {
   ensurePersonalWorkspace,
@@ -47,6 +47,15 @@ export const quotaRouter = router({
   dashboard: protectedProcedure.input(workspaceInput).query(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id);
     return listWorkspaceDashboard(input.workspaceId);
+  }),
+  taskEvents: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), taskId: z.number().int().positive().optional() })).query(async ({ ctx, input }) => {
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    const db = await getDb();
+    if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+    return db.select().from(taskEvents).where(input.taskId
+      ? and(eq(taskEvents.workspaceId, input.workspaceId), eq(taskEvents.taskId, input.taskId))
+      : eq(taskEvents.workspaceId, input.workspaceId),
+    ).orderBy(desc(taskEvents.createdAt)).limit(200);
   }),
   evaluateRouteLab: protectedProcedure.input(z.object({
     workspaceId: z.number().int().positive(),
