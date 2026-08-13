@@ -169,6 +169,13 @@
       "when": 1786636842343,
       "tag": "0023_closed_the_order",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "5",
+      "when": 1786637374059,
+      "tag": "0024_vengeful_spiral",
+      "breakpoints": true
     }
   ]
 }

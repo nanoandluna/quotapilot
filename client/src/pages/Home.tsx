@@ -219,6 +219,9 @@ export default function Home() {
   const [taskOpen, setTaskOpen] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [taskTitle, setTaskTitle] = useState("训练管线代码审查");
+  const [taskIdempotencyKey, setTaskIdempotencyKey] = useState(() =>
+    crypto.randomUUID()
+  );
   const [maxContextTokens, setMaxContextTokens] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<
@@ -302,6 +305,7 @@ export default function Home() {
         }
       );
       setTaskOpen(false);
+      setTaskIdempotencyKey(crypto.randomUUID());
       if (activeWorkspaceId)
         utils.quota.dashboard.invalidate({ workspaceId: activeWorkspaceId });
     },
@@ -354,6 +358,17 @@ export default function Home() {
     },
     onError: error =>
       toast.error("无法取消任务", { description: error.message }),
+  });
+  const pauseTask = trpc.quota.pauseTask.useMutation({
+    onSuccess: result => {
+      toast.success("任务已暂停", {
+        description: `任务 #${result.taskId} 的未消耗预留已释放；恢复时会重新执行准入检查。`,
+      });
+      if (activeWorkspaceId)
+        utils.quota.dashboard.invalidate({ workspaceId: activeWorkspaceId });
+    },
+    onError: error =>
+      toast.error("无法暂停任务", { description: error.message }),
   });
   const resumeTask = trpc.quota.resumeTask.useMutation({
     onSuccess: result => {
@@ -657,6 +672,7 @@ export default function Home() {
           : {}),
       },
       experimentId: priority === "P0" ? "formal-run" : undefined,
+      idempotencyKey: taskIdempotencyKey,
     });
   };
   const settleAttempt = (
@@ -1787,6 +1803,23 @@ export default function Home() {
                             <span className="handoff-mark">
                               {decision.admissionDecision}
                             </span>
+                          )}
+                          {["queued", "reserved"].includes(task.status) && (
+                            <button
+                              className="decision-action muted-action"
+                              disabled={
+                                !activeWorkspaceId || pauseTask.isPending
+                              }
+                              onClick={() =>
+                                activeWorkspaceId &&
+                                pauseTask.mutate({
+                                  workspaceId: activeWorkspaceId,
+                                  taskId: task.id,
+                                })
+                              }
+                            >
+                              Pause
+                            </button>
                           )}
                           {task.status === "paused" && (
                             <button

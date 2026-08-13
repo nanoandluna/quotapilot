@@ -325,6 +325,7 @@ export const researchTasks = mysqlTable("research_tasks", {
   resultClass: mysqlEnum("resultClass", ["official", "fallback", "exploratory", "recovery"]).default("exploratory").notNull(),
   experimentId: varchar("experimentId", { length: 128 }),
   runId: varchar("runId", { length: 128 }),
+  idempotencyKey: varchar("idempotencyKey", { length: 128 }),
   requirements: json("requirements").$type<TaskRequirements>().notNull(),
   requestedModelId: varchar("requestedModelId", { length: 160 }),
   estimatedInputTokens: int("estimatedInputTokens").default(0).notNull(),
@@ -343,6 +344,7 @@ export const researchTasks = mysqlTable("research_tasks", {
 }, table => [
   index("research_tasks_workspace_status_idx").on(table.workspaceId, table.status),
   index("research_tasks_workspace_priority_idx").on(table.workspaceId, table.priority),
+  uniqueIndex("research_tasks_workspace_idempotency_unique").on(table.workspaceId, table.idempotencyKey),
 ]);
 
 export const budgetReservations = mysqlTable("budget_reservations", {

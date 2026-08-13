@@ -1,0 +1,2 @@
+ALTER TABLE `research_tasks` ADD `idempotencyKey` varchar(128);--> statement-breakpoint
+ALTER TABLE `research_tasks` ADD CONSTRAINT `research_tasks_workspace_idempotency_unique` UNIQUE(`workspaceId`,`idempotencyKey`);
