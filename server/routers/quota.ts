@@ -185,6 +185,7 @@ export const quotaRouter = router({
             maxToolCalls: null,
             maxAgentSteps: null,
             chunkInput: false,
+            splitTask: false,
             preserveRequestedModel: false,
           },
         }).where(and(

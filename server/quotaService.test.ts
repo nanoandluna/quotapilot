@@ -106,6 +106,8 @@ describe("QuotaPilot V2 budget engine", () => {
     expect(getFailurePolicy("CONTEXT_OVERFLOW", "P2").degradationSteps).toContain("压缩上下文");
     expect(getFailurePolicy("UNKNOWN", "P3")).toMatchObject({ recommendedAction: "manual_handoff", retryMode: "none", requiresHumanHandoff: true });
     expect(getFailureExecutionPlan("CONTEXT_OVERFLOW")).toMatchObject({ contextReductionRatio: 0.7, chunkInput: true, maxToolCalls: 3 });
+    expect(getFailureExecutionPlan("CONTEXT_OVERFLOW")).toMatchObject({ splitTask: true, outputReductionRatio: 0.8, maxAgentSteps: 3 });
+    expect(getFailureExecutionPlan("TIMEOUT")).toMatchObject({ splitTask: true, outputReductionRatio: 0.7, maxAgentSteps: 4 });
     expect(getFailureExecutionPlan("TOOL_ERROR")).toMatchObject({ maxToolCalls: 2, maxAgentSteps: 3 });
   });
 

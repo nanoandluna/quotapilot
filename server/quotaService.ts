@@ -37,6 +37,7 @@ export type FailureExecutionPlan = {
   maxToolCalls: number | null;
   maxAgentSteps: number | null;
   chunkInput: boolean;
+  splitTask: boolean;
   preserveRequestedModel: boolean;
 };
 
@@ -56,10 +57,10 @@ export function getFailurePolicy(domain: FailureDomain, priority: "P0" | "P1" | 
 }
 
 export function getFailureExecutionPlan(domain: FailureDomain): FailureExecutionPlan {
-  const baseline: FailureExecutionPlan = { contextReductionRatio: 1, outputReductionRatio: 1, maxToolCalls: null, maxAgentSteps: null, chunkInput: false, preserveRequestedModel: true };
+  const baseline: FailureExecutionPlan = { contextReductionRatio: 1, outputReductionRatio: 1, maxToolCalls: null, maxAgentSteps: null, chunkInput: false, splitTask: false, preserveRequestedModel: true };
   const plans: Partial<Record<FailureDomain, FailureExecutionPlan>> = {
-    TIMEOUT: { ...baseline, outputReductionRatio: 0.7, maxToolCalls: 3, maxAgentSteps: 4 },
-    CONTEXT_OVERFLOW: { ...baseline, contextReductionRatio: 0.7, outputReductionRatio: 0.8, maxToolCalls: 3, maxAgentSteps: 3, chunkInput: true },
+    TIMEOUT: { ...baseline, outputReductionRatio: 0.7, maxToolCalls: 3, maxAgentSteps: 4, splitTask: true },
+    CONTEXT_OVERFLOW: { ...baseline, contextReductionRatio: 0.7, outputReductionRatio: 0.8, maxToolCalls: 3, maxAgentSteps: 3, chunkInput: true, splitTask: true },
     TOOL_ERROR: { ...baseline, maxToolCalls: 2, maxAgentSteps: 3 },
   };
   return plans[domain] ?? baseline;
