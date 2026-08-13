@@ -225,6 +225,12 @@ export const quotaRouter = router({
     if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
     return db.select().from(workspaceMembers).where(eq(workspaceMembers.workspaceId, input.workspaceId));
   }),
+  auditLogs: protectedProcedure.input(workspaceInput).query(async ({ ctx, input }) => {
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "admin");
+    const db = await getDb();
+    if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+    return db.select().from(workspaceAuditLogs).where(eq(workspaceAuditLogs.workspaceId, input.workspaceId)).orderBy(desc(workspaceAuditLogs.createdAt)).limit(100);
+  }),
   inviteMember: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), email: z.string().email(), role: z.enum(["admin", "researcher", "reviewer", "viewer"]) })).mutation(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id, "admin");
     const db = await getDb();
