@@ -2,6 +2,7 @@
 
 ## 连接与安全
 
+- [x] 在用户明确提供凭据前维持离线模式：禁止外部 provider 调用，连接状态固定为待配置，仅接受 CSV/JSON 导入和手工账本结算。
 - [ ] 采用定时同步与数据库队列运行方式：按策略窗口同步额度、处理待执行任务并生成预算告警，不部署常驻 worker。
 - [x] 在未配置外部凭据期间完成 V2 本地/数据库功能，并将实时 OpenCode Go 与 OpenAI API 同步显式标记为“待配置”，禁止误触发外部调用。
 - [ ] 确认 OpenCode Go 与 ChatGPT/ OpenAI 可用的官方额度查询接口、认证方式、响应字段和重置时间字段。
@@ -54,7 +55,7 @@
 - [ ] 建立 QUOTA、RATE_LIMIT、TIMEOUT、PROVIDER_ERROR、MODEL_UNAVAILABLE、CONTEXT_OVERFLOW、TOOL_ERROR、UNKNOWN 故障域及对应重试、退避、压缩、熔断和切换策略。
 - [ ] 将额度感知路由器从前端模拟逻辑迁移为服务端可审计策略。
 - [x] 实现 5 小时、周、月窗口的预算预测、保护仓、burn rate 和提前迁移阈值。
-- [ ] 实现预算告警：进入 YELLOW/ORANGE/RED、预测重置前耗尽、连接失效和队列阻塞。
+- [x] 实现预算告警：进入 YELLOW/ORANGE/RED、预测重置前耗尽、连接失效和队列阻塞。
 - [x] 建立站内通知与告警确认状态，避免同一事件重复告警。
 
 ## 真实任务队列

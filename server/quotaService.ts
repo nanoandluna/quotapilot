@@ -387,6 +387,14 @@ export async function refreshWorkspaceBudgets(workspaceId: number) {
     title: "任务队列存在暂停项",
     message: "至少一个任务无法通过共享预算准入检查；请补充额度、等待重置或手动调整任务预算。",
   });
+  const pendingConnection = (await db.select().from(providerConnections).where(eq(providerConnections.workspaceId, workspaceId))).find(connection => connection.syncMode === "scheduled" && (connection.secretState !== "configured" || connection.connectionState === "error"));
+  if (pendingConnection) await createUnacknowledgedAlert({
+    workspaceId,
+    severity: "info",
+    kind: "connection",
+    title: "自动额度同步待配置",
+    message: `${pendingConnection.displayName} 尚未建立可用同步连接；CSV/JSON 导入、预算策略、任务队列和实验账本仍可本地使用。`,
+  });
 }
 
 function sumCostSince(events: Array<typeof usageEvents.$inferSelect>, now: Date, rangeMs: number) {
