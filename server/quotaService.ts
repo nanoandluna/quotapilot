@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, isNull, lte } from "drizzle-orm";
+import { and, desc, eq, gte, isNull, lte, sql } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { createHash } from "node:crypto";
 import {
@@ -119,6 +119,44 @@ export function getAdmissionDecision(input: {
   }
   if (input.budgetState === "ORANGE" && (input.priority === "P2" || input.priority === "P3")) return "MIGRATE";
   return "ADMIT";
+}
+
+export type RoutingModel = {
+  modelId: string;
+  displayName: string;
+  inputPerMillionUsd: number;
+  outputPerMillionUsd: number;
+  scarcityFactor: number;
+  maxConcurrency: number;
+  capability: CapabilityMatrix;
+};
+
+export function scoreCandidateModels(requirements: TaskRequirements, models: RoutingModel[]) {
+  const requiredCapabilities = (Object.entries(requirements) as Array<[keyof TaskRequirements, unknown]>).filter(([key, value]) => key in capability({}) && typeof value === "number" && value > 0) as Array<[keyof CapabilityMatrix, number]>;
+  return models
+    .filter(model => model.maxConcurrency > 0)
+    .filter(model => !requirements.requiresVision || model.capability.vision > 0)
+    .filter(model => !requirements.requiresToolUse || model.capability.toolUse > 0)
+    .filter(model => requiredCapabilities.every(([key, required]) => model.capability[key] >= required))
+    .map(model => {
+      const capabilityFit = requiredCapabilities.length
+        ? requiredCapabilities.reduce((total, [key, required]) => total + Math.min(1, model.capability[key] / Math.max(1, required)), 0) / requiredCapabilities.length
+        : 0.6;
+      const quality = (capabilityFit * 0.55) + ((model.capability.reliability / 10) * 0.25) + ((model.capability.speed / 10) * 0.1);
+      const price = model.inputPerMillionUsd + model.outputPerMillionUsd;
+      const score = (quality * 100) - (price * 1.5) - (model.scarcityFactor * 12);
+      return { ...model, score: Number(score.toFixed(3)), reason: `能力满足硬约束；可靠性 ${model.capability.reliability}/10，稀缺性 ${model.scarcityFactor.toFixed(2)}。` };
+    })
+    .sort((left, right) => right.score - left.score);
+}
+
+export function resolveTaskRouting(requirements: TaskRequirements, models: RoutingModel[], requestedModelId?: string) {
+  const candidates = scoreCandidateModels(requirements, models);
+  return {
+    candidates,
+    recommendedModelId: candidates[0]?.modelId ?? requestedModelId,
+    blockedByCapability: candidates.length === 0,
+  };
 }
 
 function describeRouteDecision(decision: "ADMIT" | "RESERVE" | "MIGRATE" | "QUEUE" | "HOLD") {
@@ -414,50 +452,103 @@ export async function saveUsageImport(input: {
   const format = input.filename.toLowerCase().endsWith(".json") ? "json" : "csv";
   const events = parseUsageImport(input.content, format);
   const checksum = createHash("sha256").update(input.content).digest("hex");
-  const duplicate = (await db.select().from(usageEvents).where(and(eq(usageEvents.workspaceId, input.workspaceId), eq(usageEvents.externalRef, `import:${checksum}`))).limit(1))[0];
-  if (duplicate) throw new TRPCError({ code: "CONFLICT", message: "该文件内容已导入过，请勿重复上传。" });
+  const duplicate = (await db.select().from(usageImportBatches).where(and(eq(usageImportBatches.workspaceId, input.workspaceId), eq(usageImportBatches.checksum, checksum))).limit(1))[0];
+  if (duplicate && duplicate.status !== "failed") throw new TRPCError({ code: "CONFLICT", message: "该文件内容已导入过，请勿重复上传。" });
 
-  const uploaded = await storagePut(`quota-pilot/${input.workspaceId}/imports/${input.filename}`, input.content, input.mimeType);
-  const batchResult = await db.insert(usageImportBatches).values({
-    workspaceId: input.workspaceId,
-    importedByUserId: input.userId,
-    filename: input.filename,
-    mimeType: input.mimeType,
-    storageKey: uploaded.key,
-    storageUrl: uploaded.url,
-    checksum,
-    format,
-    rowsReceived: events.length,
-    rowsAccepted: events.length,
-    status: "completed",
-  });
-  const batchId = Number(batchResult[0].insertId);
-  const connections = await db.select().from(providerConnections).where(eq(providerConnections.workspaceId, input.workspaceId));
-  const connectionByProvider = new Map(connections.map(connection => [connection.provider, connection]));
-  const models = await db.select().from(modelRegistry);
-  const modelByProviderAndId = new Map(models.map(model => [`${model.provider}:${model.modelId}`, model]));
-
-  await db.insert(usageEvents).values(events.map((event, index) => {
-    const connection = connectionByProvider.get(event.provider as "opencode_go" | "openai_api" | "chatgpt_plus_manual" | "local");
-    const model = modelByProviderAndId.get(`${event.provider}:${event.modelId}`);
-    return {
+  let uploaded: { key: string; url: string } | undefined;
+  try {
+    uploaded = await storagePut(`quota-pilot/${input.workspaceId}/imports/${checksum}.${format}`, input.content, input.mimeType);
+    const stored = uploaded;
+    if (!stored) throw new Error("对象存储未返回导入文件引用。");
+    const connections = await db.select().from(providerConnections).where(eq(providerConnections.workspaceId, input.workspaceId));
+    const connectionByProvider = new Map(connections.map(connection => [connection.provider, connection]));
+    const models = await db.select().from(modelRegistry);
+    const modelByProviderAndId = new Map(models.map(model => [`${model.provider}:${model.modelId}`, model]));
+    const batchId = await db.transaction(async tx => {
+      let createdBatchId = duplicate?.status === "failed" ? duplicate.id : undefined;
+      if (createdBatchId) {
+        await tx.update(usageImportBatches).set({
+          importedByUserId: input.userId,
+          filename: input.filename,
+          mimeType: input.mimeType,
+          storageKey: stored.key,
+          storageUrl: stored.url,
+          format,
+          rowsReceived: events.length,
+          rowsAccepted: 0,
+          rowsRejected: 0,
+          status: "processing",
+          errorSummary: null,
+          updatedAt: new Date(),
+        }).where(eq(usageImportBatches.id, createdBatchId));
+      } else {
+        const batchResult = await tx.insert(usageImportBatches).values({
+          workspaceId: input.workspaceId,
+          importedByUserId: input.userId,
+          filename: input.filename,
+          mimeType: input.mimeType,
+          storageKey: stored.key,
+          storageUrl: stored.url,
+          checksum,
+          format,
+          rowsReceived: events.length,
+          rowsAccepted: 0,
+          status: "processing",
+        });
+        createdBatchId = Number(batchResult[0].insertId);
+      }
+      await tx.insert(usageEvents).values(events.map((event, index) => {
+        const connection = connectionByProvider.get(event.provider as "opencode_go" | "openai_api" | "chatgpt_plus_manual" | "local");
+        const model = modelByProviderAndId.get(`${event.provider}:${event.modelId}`);
+        return {
+          workspaceId: input.workspaceId,
+          providerConnectionId: connection?.id,
+          importBatchId: createdBatchId!,
+          modelRegistryId: model?.id,
+          provider: event.provider,
+          modelId: event.modelId,
+          tokens: event.tokens,
+          estimatedCostUsd: event.estimatedCostUsd.toFixed(6),
+          actualCostUsd: event.actualCostUsd?.toFixed(6),
+          source: "import" as const,
+          occurredAt: event.occurredAt,
+          externalRef: event.externalRef || `batch:${createdBatchId}:row:${index}`,
+        };
+      }));
+      await tx.update(usageImportBatches).set({ status: "completed", rowsAccepted: events.length, updatedAt: new Date() }).where(eq(usageImportBatches.id, createdBatchId!));
+      return createdBatchId!;
+    });
+    await refreshWorkspaceBudgets(input.workspaceId).catch(error => console.error("[QuotaPilot] import committed but budget refresh failed", error));
+    return { batchId, accepted: events.length, storageUrl: uploaded.url };
+  } catch (error) {
+    if (isDuplicateKeyError(error)) throw new TRPCError({ code: "CONFLICT", message: "该文件内容已导入过，请勿重复上传。" });
+    const failure = {
       workspaceId: input.workspaceId,
-      providerConnectionId: connection?.id,
-      importBatchId: batchId,
-      modelRegistryId: model?.id,
-      provider: event.provider,
-      modelId: event.modelId,
-      tokens: event.tokens,
-      estimatedCostUsd: event.estimatedCostUsd.toFixed(6),
-      actualCostUsd: event.actualCostUsd?.toFixed(6),
-      source: "import" as const,
-      occurredAt: event.occurredAt,
-      externalRef: event.externalRef || `batch:${batchId}:row:${index}`,
-    };
-  }));
+      importedByUserId: input.userId,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      storageKey: uploaded?.key,
+      storageUrl: uploaded?.url,
+      checksum,
+      format,
+      rowsReceived: events.length,
+      rowsAccepted: 0,
+      rowsRejected: events.length,
+      status: "failed" as const,
+      errorSummary: error instanceof Error ? error.message.slice(0, 2000) : "导入事务失败",
+      updatedAt: new Date(),
+    } satisfies typeof usageImportBatches.$inferInsert;
+    if (duplicate?.status === "failed") {
+      await db.update(usageImportBatches).set(failure).where(eq(usageImportBatches.id, duplicate.id)).catch(() => undefined);
+    } else {
+      await db.insert(usageImportBatches).values(failure).catch(() => undefined);
+    }
+    throw error;
+  }
+}
 
-  await refreshWorkspaceBudgets(input.workspaceId);
-  return { batchId, accepted: events.length, storageUrl: uploaded.url };
+function isDuplicateKeyError(error: unknown) {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "ER_DUP_ENTRY";
 }
 
 export async function reserveTaskBudget(input: {
@@ -478,31 +569,24 @@ export async function reserveTaskBudget(input: {
 }) {
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+  const routingModels = (await db.select().from(modelRegistry).where(eq(modelRegistry.isActive, true))).map(model => ({
+    modelId: model.modelId,
+    displayName: model.displayName,
+    inputPerMillionUsd: asNumber(model.inputPerMillionUsd),
+    outputPerMillionUsd: asNumber(model.outputPerMillionUsd),
+    scarcityFactor: asNumber(model.scarcityFactor),
+    maxConcurrency: model.maxConcurrency,
+    capability: model.capability,
+  }));
+  const routing = resolveTaskRouting(input.requirements, routingModels, input.requestedModelId);
+  const { candidates, recommendedModelId } = routing;
+  const capabilityBlocked = routing.blockedByCapability;
   await refreshWorkspaceBudgets(input.workspaceId);
-  const taskResult = await db.insert(researchTasks).values({
-    workspaceId: input.workspaceId,
-    createdByUserId: input.userId,
-    title: input.title,
-    description: input.description,
-    priority: input.priority,
-    taskClass: input.taskClass,
-    routeMode: input.routeMode,
-    resultClass: input.resultClass,
-    requestedModelId: input.requestedModelId,
-    requirements: input.requirements,
-    estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
-    taskBudgetUsd: input.taskBudgetUsd.toFixed(6),
-    experimentId: input.experimentId,
-    runId: input.runId,
-    status: "queued",
-    queuedAt: new Date(),
-  });
-  const taskId = Number(taskResult[0].insertId);
   const budget = (await db.select().from(providerBudgets).where(and(eq(providerBudgets.workspaceId, input.workspaceId), eq(providerBudgets.window, "five_hour"))).limit(1))[0];
   if (!budget) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "缺少可用于任务预留的五小时共享预算。" });
   const available = asNumber(budget.limitUsd) - asNumber(budget.consumedUsd) - asNumber(budget.reservedUsd);
   const requiresReservation = input.priority === "P0" || input.priority === "P1";
-  const admission = getAdmissionDecision({
+  const admission = capabilityBlocked ? "HOLD" as const : getAdmissionDecision({
     priority: input.priority,
     routeMode: input.routeMode,
     estimatedCostUsd: input.estimatedCostUsd,
@@ -510,81 +594,88 @@ export async function reserveTaskBudget(input: {
     dynamicReserveUsd: asNumber(budget.dynamicReserveUsd),
     budgetState: budget.state,
   });
-  const decisionDetails = describeRouteDecision(admission);
-  if (requiresReservation && admission === "HOLD") {
-    await db.update(researchTasks).set({ status: "paused", admissionDecision: "HOLD", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
-    const attemptResult = await db.insert(taskAttempts).values({
+  const result = await db.transaction(async tx => {
+    const taskResult = await tx.insert(researchTasks).values({
+      workspaceId: input.workspaceId,
+      createdByUserId: input.userId,
+      title: input.title,
+      description: input.description,
+      priority: input.priority,
+      taskClass: input.taskClass,
+      routeMode: input.routeMode,
+      resultClass: input.resultClass,
+      requestedModelId: recommendedModelId,
+      requirements: input.requirements,
+      estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
+      taskBudgetUsd: input.taskBudgetUsd.toFixed(6),
+      experimentId: input.experimentId,
+      runId: input.runId,
+      status: "queued",
+      queuedAt: new Date(),
+    });
+    const taskId = Number(taskResult[0].insertId);
+    let effectiveAdmission = admission;
+    let reservationCommitted = false;
+    if (requiresReservation && admission !== "HOLD") {
+      const conditionalReserve = await tx.update(providerBudgets).set({
+        reservedUsd: sql`${providerBudgets.reservedUsd} + ${input.estimatedCostUsd.toFixed(6)}`,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(providerBudgets.id, budget.id),
+        sql`${providerBudgets.limitUsd} - ${providerBudgets.consumedUsd} - ${providerBudgets.reservedUsd} >= ${input.estimatedCostUsd.toFixed(6)}`,
+      ));
+      reservationCommitted = conditionalReserve[0].affectedRows === 1;
+      if (reservationCommitted) {
+        await tx.insert(budgetReservations).values({
+          workspaceId: input.workspaceId,
+          providerBudgetId: budget.id,
+          taskId,
+          amountUsd: input.estimatedCostUsd.toFixed(6),
+          status: "RESERVED",
+          expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000),
+        });
+      } else {
+        effectiveAdmission = "HOLD";
+      }
+    }
+    const decisionDetails = capabilityBlocked
+      ? { reason: "没有模型满足任务的能力硬约束；不能为保持队列而静默降级。", action: "manual_handoff" as const, human: true }
+      : describeRouteDecision(effectiveAdmission);
+    const candidateReason = candidates[0]
+      ? `${decisionDetails.reason} 候选模型：${candidates[0].displayName}（评分 ${candidates[0].score}）。`
+      : decisionDetails.reason;
+    const taskStatus = reservationCommitted ? "reserved" : effectiveAdmission === "HOLD" || effectiveAdmission === "MIGRATE" ? "paused" : "queued";
+    await tx.update(researchTasks).set({ status: taskStatus, admissionDecision: effectiveAdmission, updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
+    const attemptResult = await tx.insert(taskAttempts).values({
       workspaceId: input.workspaceId,
       taskId,
       attemptNumber: 1,
-      requestedModelId: input.requestedModelId,
-      actualModelId: input.requestedModelId,
+      requestedModelId: recommendedModelId,
+      actualModelId: recommendedModelId,
       provider: "opencode_go",
       quotaState: budget.state,
       resultClass: input.resultClass,
       estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
       status: "queued",
     });
-    await db.insert(routeDecisions).values({
+    await tx.insert(routeDecisions).values({
       workspaceId: input.workspaceId,
       taskId,
       attemptId: Number(attemptResult[0].insertId),
-      admissionDecision: admission,
+      admissionDecision: effectiveAdmission,
       budgetState: budget.state,
       availableUsd: available.toFixed(6),
       dynamicReserveUsd: asNumber(budget.dynamicReserveUsd).toFixed(6),
       estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
-      reason: decisionDetails.reason,
+      reason: candidateReason,
       recommendedAction: decisionDetails.action,
+      selectedModelId: recommendedModelId,
       requiresHumanHandoff: decisionDetails.human,
     });
-    return { taskId, reserved: false, state: "PAUSED", admission: "HOLD" as const };
-  }
-  if (admission === "MIGRATE") {
-    await db.update(researchTasks).set({ status: "paused", admissionDecision: "MIGRATE", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
-  } else if (admission === "QUEUE") {
-    await db.update(researchTasks).set({ status: "queued", admissionDecision: "QUEUE", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
-  } else if (admission === "ADMIT") {
-    await db.update(researchTasks).set({ status: "queued", admissionDecision: "ADMIT", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
-  }
-  if (requiresReservation) {
-    await db.insert(budgetReservations).values({
-      workspaceId: input.workspaceId,
-      providerBudgetId: budget.id,
-      taskId,
-      amountUsd: input.estimatedCostUsd.toFixed(6),
-      status: "RESERVED",
-      expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000),
-    });
-    await db.update(researchTasks).set({ status: "reserved", admissionDecision: "RESERVE", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
-  }
-  const attemptResult = await db.insert(taskAttempts).values({
-    workspaceId: input.workspaceId,
-    taskId,
-    attemptNumber: 1,
-    requestedModelId: input.requestedModelId,
-    actualModelId: input.requestedModelId,
-    provider: "opencode_go",
-    quotaState: budget.state,
-    resultClass: input.resultClass,
-    estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
-    status: "queued",
+    return { taskId, reserved: reservationCommitted, state: reservationCommitted ? "RESERVED" as const : effectiveAdmission === "HOLD" ? "PAUSED" as const : "QUEUED" as const, admission: effectiveAdmission };
   });
-  await db.insert(routeDecisions).values({
-    workspaceId: input.workspaceId,
-    taskId,
-    attemptId: Number(attemptResult[0].insertId),
-    admissionDecision: admission,
-    budgetState: budget.state,
-    availableUsd: available.toFixed(6),
-    dynamicReserveUsd: asNumber(budget.dynamicReserveUsd).toFixed(6),
-    estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
-    reason: decisionDetails.reason,
-    recommendedAction: decisionDetails.action,
-    requiresHumanHandoff: decisionDetails.human,
-  });
-  await refreshWorkspaceBudgets(input.workspaceId);
-  return { taskId, reserved: requiresReservation, state: requiresReservation ? "RESERVED" : "QUEUED", admission };
+  await refreshWorkspaceBudgets(input.workspaceId).catch(error => console.error("[QuotaPilot] reservation committed but budget refresh failed", error));
+  return result;
 }
 
 export async function recordTaskAttemptExecution(input: {
@@ -604,57 +695,31 @@ export async function recordTaskAttemptExecution(input: {
 }) {
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
-  const task = (await db.select().from(researchTasks).where(and(eq(researchTasks.id, input.taskId), eq(researchTasks.workspaceId, input.workspaceId))).limit(1))[0];
-  const attempt = (await db.select().from(taskAttempts).where(and(eq(taskAttempts.id, input.attemptId), eq(taskAttempts.taskId, input.taskId), eq(taskAttempts.workspaceId, input.workspaceId))).limit(1))[0];
-  if (!task || !attempt) throw new TRPCError({ code: "NOT_FOUND", message: "任务或执行 attempt 不存在。" });
-  if ((input.fallback || input.actualModelId !== task.requestedModelId) && input.resultClass === "official") {
-    throw new TRPCError({ code: "PRECONDITION_FAILED", message: "模型切换后的 attempt 不能写入 official 结果；请标记为 fallback 或 recovery。" });
-  }
-  if (input.actualCostUsd > asNumber(task.taskBudgetUsd)) {
-    throw new TRPCError({ code: "PRECONDITION_FAILED", message: "实际成本超过任务预算，系统拒绝写入完成结果。" });
-  }
-  const finalTaskStatus = input.status === "completed" ? "completed" : input.status === "cancelled" ? "cancelled" : "failed";
-  const finalResultClass = input.fallback || input.actualModelId !== task.requestedModelId
-    ? input.resultClass === "official" ? "fallback" : input.resultClass
-    : input.resultClass;
-  await db.update(taskAttempts).set({
-    actualModelId: input.actualModelId,
-    fallback: input.fallback || input.actualModelId !== task.requestedModelId,
-    fallbackReason: input.fallback || input.actualModelId !== task.requestedModelId ? input.fallbackReason ?? "manual" : null,
-    resultClass: finalResultClass,
-    status: input.status,
-    actualCostUsd: input.actualCostUsd.toFixed(6),
-    completedAt: new Date(),
-  }).where(eq(taskAttempts.id, attempt.id));
-  await db.update(researchTasks).set({
-    actualCostUsd: input.actualCostUsd.toFixed(6),
-    resultClass: finalResultClass,
-    status: finalTaskStatus,
-    completedAt: new Date(),
-    updatedAt: new Date(),
-  }).where(eq(researchTasks.id, task.id));
-  const reservationStatus = input.status === "completed" ? "CONSUMED" : "RELEASED";
-  await db.update(budgetReservations).set({ status: reservationStatus, updatedAt: new Date() }).where(and(eq(budgetReservations.taskId, task.id), eq(budgetReservations.status, "RESERVED")));
-  const connection = (await db.select().from(providerConnections).where(and(eq(providerConnections.workspaceId, input.workspaceId), eq(providerConnections.provider, "opencode_go"))).limit(1))[0];
-  await db.insert(usageEvents).values({
-    workspaceId: input.workspaceId,
-    providerConnectionId: connection?.id,
-    provider: "opencode_go",
-    modelId: input.actualModelId,
-    tokens: {
-      inputTokens: input.inputTokens,
-      outputTokens: input.outputTokens,
-      cacheReadTokens: input.cacheReadTokens,
-      cacheWriteTokens: input.cacheWriteTokens,
-    },
-    estimatedCostUsd: attempt.estimatedCostUsd,
-    actualCostUsd: input.actualCostUsd.toFixed(6),
-    source: "task_attempt",
-    occurredAt: new Date(),
-    externalRef: `attempt:${attempt.id}:settled`,
+  const settled = await db.transaction(async tx => {
+    const task = (await tx.select().from(researchTasks).where(and(eq(researchTasks.id, input.taskId), eq(researchTasks.workspaceId, input.workspaceId))).limit(1))[0];
+    const attempt = (await tx.select().from(taskAttempts).where(and(eq(taskAttempts.id, input.attemptId), eq(taskAttempts.taskId, input.taskId), eq(taskAttempts.workspaceId, input.workspaceId))).limit(1))[0];
+    if (!task || !attempt) throw new TRPCError({ code: "NOT_FOUND", message: "任务或执行 attempt 不存在。" });
+    if (["completed", "failed", "cancelled"].includes(attempt.status)) throw new TRPCError({ code: "CONFLICT", message: "该 attempt 已结算，拒绝重复记账。" });
+    if ((input.fallback || input.actualModelId !== task.requestedModelId) && input.resultClass === "official") {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "模型切换后的 attempt 不能写入 official 结果；请标记为 fallback 或 recovery。" });
+    }
+    if (input.actualCostUsd > asNumber(task.taskBudgetUsd)) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "实际成本超过任务预算，系统拒绝写入完成结果。" });
+    }
+    const finalTaskStatus = input.status === "completed" ? "completed" : input.status === "cancelled" ? "cancelled" : "failed";
+    const finalResultClass = input.fallback || input.actualModelId !== task.requestedModelId
+      ? input.resultClass === "official" ? "fallback" : input.resultClass
+      : input.resultClass;
+    await tx.update(taskAttempts).set({ actualModelId: input.actualModelId, fallback: input.fallback || input.actualModelId !== task.requestedModelId, fallbackReason: input.fallback || input.actualModelId !== task.requestedModelId ? input.fallbackReason ?? "manual" : null, resultClass: finalResultClass, status: input.status, actualCostUsd: input.actualCostUsd.toFixed(6), completedAt: new Date() }).where(eq(taskAttempts.id, attempt.id));
+    await tx.update(researchTasks).set({ actualCostUsd: input.actualCostUsd.toFixed(6), resultClass: finalResultClass, status: finalTaskStatus, completedAt: new Date(), updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
+    const reservationStatus = input.status === "completed" ? "CONSUMED" : "RELEASED";
+    await tx.update(budgetReservations).set({ status: reservationStatus, updatedAt: new Date() }).where(and(eq(budgetReservations.taskId, task.id), eq(budgetReservations.status, "RESERVED")));
+    const connection = (await tx.select().from(providerConnections).where(and(eq(providerConnections.workspaceId, input.workspaceId), eq(providerConnections.provider, "opencode_go"))).limit(1))[0];
+    await tx.insert(usageEvents).values({ workspaceId: input.workspaceId, providerConnectionId: connection?.id, provider: "opencode_go", modelId: input.actualModelId, tokens: { inputTokens: input.inputTokens, outputTokens: input.outputTokens, cacheReadTokens: input.cacheReadTokens, cacheWriteTokens: input.cacheWriteTokens }, estimatedCostUsd: attempt.estimatedCostUsd, actualCostUsd: input.actualCostUsd.toFixed(6), source: "task_attempt", occurredAt: new Date(), externalRef: `attempt:${attempt.id}:settled` });
+    return { taskStatus: finalTaskStatus, resultClass: finalResultClass, reservationStatus };
   });
   await refreshWorkspaceBudgets(input.workspaceId);
-  return { taskStatus: finalTaskStatus, resultClass: finalResultClass, reservationStatus };
+  return settled;
 }
 
 export async function listWorkspaceDashboard(workspaceId: number) {

@@ -1,0 +1,1 @@
+ALTER TABLE `budget_reservations` ADD CONSTRAINT `budget_reservations_task_unique` UNIQUE(`taskId`);

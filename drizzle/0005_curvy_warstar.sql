@@ -1,0 +1,1 @@
+ALTER TABLE `usage_import_batches` ADD CONSTRAINT `usage_import_batches_workspace_checksum_unique` UNIQUE(`workspaceId`,`checksum`);

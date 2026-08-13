@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculateBudgetState, getAdmissionDecision, parseUsageImport } from "./quotaService";
+import { calculateBudgetState, getAdmissionDecision, parseUsageImport, resolveTaskRouting, scoreCandidateModels } from "./quotaService";
 
 describe("QuotaPilot V2 budget engine", () => {
   it("enters drain protection when the conservative burn rate exhausts budget before reset", () => {
@@ -65,5 +65,23 @@ describe("QuotaPilot V2 budget engine", () => {
       dynamicReserveUsd: 0.1,
       budgetState: "RED",
     })).toBe("HOLD");
+  });
+
+  it("filters models that cannot meet research requirements before ranking cost and scarcity", () => {
+    const candidates = scoreCandidateModels({ reasoning: 8, longContext: 8, requiresToolUse: true }, [
+      { modelId: "fast", displayName: "Fast", inputPerMillionUsd: 0.1, outputPerMillionUsd: 0.2, scarcityFactor: 0.2, maxConcurrency: 4, capability: { code: 7, reasoning: 7, longContext: 8, vision: 0, toolUse: 8, chinese: 7, research: 7, agent: 6, speed: 10, reliability: 8 } },
+      { modelId: "research", displayName: "Research", inputPerMillionUsd: 0.5, outputPerMillionUsd: 1, scarcityFactor: 0.6, maxConcurrency: 2, capability: { code: 9, reasoning: 9, longContext: 10, vision: 2, toolUse: 9, chinese: 8, research: 9, agent: 9, speed: 7, reliability: 9 } },
+    ]);
+    expect(candidates.map(candidate => candidate.modelId)).toEqual(["research"]);
+  });
+
+  it("blocks a task for manual handoff when no model satisfies its capability hard constraints", () => {
+    const routing = resolveTaskRouting({ vision: 8, requiresToolUse: true }, [
+      { modelId: "text-only", displayName: "Text only", inputPerMillionUsd: 0.1, outputPerMillionUsd: 0.2, scarcityFactor: 0.2, maxConcurrency: 4, capability: { code: 7, reasoning: 7, longContext: 8, vision: 0, toolUse: 8, chinese: 7, research: 7, agent: 6, speed: 10, reliability: 8 } },
+    ], "text-only");
+
+    expect(routing.candidates).toEqual([]);
+    expect(routing.blockedByCapability).toBe(true);
+    expect(routing.recommendedModelId).toBe("text-only");
   });
 });

@@ -171,7 +171,10 @@ export const usageImportBatches = mysqlTable("usage_import_batches", {
   errorSummary: text("errorSummary"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-}, table => [index("usage_import_batches_workspace_idx").on(table.workspaceId)]);
+}, table => [
+  index("usage_import_batches_workspace_idx").on(table.workspaceId),
+  uniqueIndex("usage_import_batches_workspace_checksum_unique").on(table.workspaceId, table.checksum),
+]);
 
 export const usageEvents = mysqlTable("usage_events", {
   id: int("id").autoincrement().primaryKey(),
@@ -247,6 +250,7 @@ export const budgetReservations = mysqlTable("budget_reservations", {
 }, table => [
   index("budget_reservations_budget_status_idx").on(table.providerBudgetId, table.status),
   index("budget_reservations_task_idx").on(table.taskId),
+  uniqueIndex("budget_reservations_task_unique").on(table.taskId),
 ]);
 
 export const taskAttempts = mysqlTable("task_attempts", {
