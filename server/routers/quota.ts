@@ -6,6 +6,7 @@ import { budgetAlerts, modelRegistry, providerBudgets, providerConnections, rese
 import { getDb } from "../db";
 import {
   ensurePersonalWorkspace,
+  evaluateRouteLabPolicy,
   claimTaskForLocalExecution,
   listWorkspaceDashboard,
   queueTaskRetry,
@@ -46,6 +47,18 @@ export const quotaRouter = router({
   dashboard: protectedProcedure.input(workspaceInput).query(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id);
     return listWorkspaceDashboard(input.workspaceId);
+  }),
+  evaluateRouteLab: protectedProcedure.input(z.object({
+    workspaceId: z.number().int().positive(),
+    priority: prioritySchema,
+    routeMode: z.enum(["strict", "balanced", "emergency"]),
+    scenario: z.enum(["none", "rate_limit", "quota_low", "timeout", "context_overflow"]),
+    requirements: taskRequirementsSchema,
+    estimatedCostUsd: z.number().positive().max(100_000),
+    requestedModelId: z.string().max(160).optional(),
+  })).mutation(async ({ ctx, input }) => {
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    return evaluateRouteLabPolicy(input);
   }),
   modelVersions: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), modelId: z.string().max(160).optional() })).query(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id);

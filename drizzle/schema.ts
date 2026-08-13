@@ -412,6 +412,26 @@ export const experimentExecutionLedger = mysqlTable("experiment_execution_ledger
   index("experiment_ledger_experiment_run_idx").on(table.experimentId, table.runId),
 ]);
 
+/** Append-only evidence for Route Lab policy evaluations; it records a decision without creating a task or invoking a provider. */
+export const routePolicyEvaluations = mysqlTable("route_policy_evaluations", {
+  id: int("id").autoincrement().primaryKey(),
+  workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  priority: mysqlEnum("evaluationPriority", ["P0", "P1", "P2", "P3"]).notNull(),
+  routeMode: mysqlEnum("evaluationRouteMode", ["strict", "balanced", "emergency"]).notNull(),
+  scenario: mysqlEnum("evaluationScenario", ["none", "rate_limit", "quota_low", "timeout", "context_overflow"]).default("none").notNull(),
+  requirements: json("requirements").$type<TaskRequirements>().notNull(),
+  estimatedCostUsd: decimal("estimatedCostUsd", { precision: 12, scale: 6 }).notNull(),
+  requestedModelId: varchar("requestedModelId", { length: 160 }),
+  selectedModelId: varchar("selectedModelId", { length: 160 }),
+  admissionDecision: mysqlEnum("evaluationDecision", ["ADMIT", "RESERVE", "MIGRATE", "QUEUE", "HOLD"]).notNull(),
+  budgetState: mysqlEnum("evaluationBudgetState", ["GREEN", "YELLOW", "ORANGE", "DRAIN_PROTECTION", "RED"]).notNull(),
+  reason: text("reason").notNull(),
+  routePlan: json("routePlan").$type<RoutePlanSnapshot>().notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, table => [
+  index("route_policy_evaluations_workspace_created_idx").on(table.workspaceId, table.createdAt),
+]);
+
 export const routeDecisions = mysqlTable("route_decisions", {
   id: int("id").autoincrement().primaryKey(),
   workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),

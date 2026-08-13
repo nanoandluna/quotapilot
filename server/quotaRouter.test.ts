@@ -10,6 +10,7 @@ const doubles = vi.hoisted(() => ({
   reserveTaskBudget: vi.fn(),
   saveUsageImport: vi.fn(),
   scoreCandidateModels: vi.fn(),
+  evaluateRouteLabPolicy: vi.fn(),
 }));
 
 vi.mock("./db", () => ({ getDb: doubles.getDb }));
@@ -21,6 +22,7 @@ vi.mock("./quotaService", () => ({
   reserveTaskBudget: doubles.reserveTaskBudget,
   saveUsageImport: doubles.saveUsageImport,
   scoreCandidateModels: doubles.scoreCandidateModels,
+  evaluateRouteLabPolicy: doubles.evaluateRouteLabPolicy,
 }));
 
 import { quotaRouter } from "./routers/quota";
@@ -86,6 +88,30 @@ describe("QuotaPilot V2 route decision state machine", () => {
     await expect(caller.actOnRouteDecision({ workspaceId: 7, decisionId: 99, action: "hold" })).rejects.toMatchObject({ code: "CONFLICT" });
 
     expect(transaction.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends Route Lab scenarios to the protected server-side policy evaluator", async () => {
+    doubles.evaluateRouteLabPolicy.mockResolvedValue({ evaluationId: 12, decision: "QUEUE", providerCallsDisabled: true });
+    const caller = quotaRouter.createCaller(authenticatedContext());
+
+    const result = await caller.evaluateRouteLab({
+      workspaceId: 7,
+      priority: "P2",
+      routeMode: "balanced",
+      scenario: "rate_limit",
+      requirements: { code: 6, speed: 8 },
+      estimatedCostUsd: 0.08,
+      requestedModelId: "deepseek-v4-flash",
+    });
+
+    expect(result).toMatchObject({ evaluationId: 12, decision: "QUEUE", providerCallsDisabled: true });
+    expect(doubles.evaluateRouteLabPolicy).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: 7,
+      priority: "P2",
+      routeMode: "balanced",
+      scenario: "rate_limit",
+      estimatedCostUsd: 0.08,
+    }));
   });
 
   it("binds a manually selected migration candidate to the queued attempt before releasing the task back to queue", async () => {

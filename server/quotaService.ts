@@ -12,6 +12,7 @@ import {
   quotaSnapshots,
   researchTasks,
   routeDecisions,
+  routePolicyEvaluations,
   schedulerSettings,
   taskAttempts,
   usageEvents,
@@ -1085,6 +1086,98 @@ export async function reserveTaskBudget(input: {
   });
   await refreshWorkspaceBudgets(input.workspaceId).catch(error => console.error("[QuotaPilot] reservation committed but budget refresh failed", error));
   return result;
+}
+
+export async function evaluateRouteLabPolicy(input: {
+  workspaceId: number;
+  priority: "P0" | "P1" | "P2" | "P3";
+  routeMode: RouteMode;
+  scenario: "none" | "rate_limit" | "quota_low" | "timeout" | "context_overflow";
+  requirements: TaskRequirements;
+  estimatedCostUsd: number;
+  requestedModelId?: string;
+}) {
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+  await refreshWorkspaceBudgets(input.workspaceId);
+  const [models, connections, budgets, runningAttempts] = await Promise.all([
+    db.select().from(modelRegistry).where(eq(modelRegistry.isActive, true)),
+    db.select().from(providerConnections).where(eq(providerConnections.workspaceId, input.workspaceId)),
+    db.select().from(providerBudgets).where(and(eq(providerBudgets.workspaceId, input.workspaceId), eq(providerBudgets.window, "five_hour"))),
+    db.select().from(taskAttempts).where(and(eq(taskAttempts.workspaceId, input.workspaceId), eq(taskAttempts.status, "running"))),
+  ]);
+  const activeConcurrencyByModel = new Map<string, number>();
+  for (const attempt of runningAttempts) {
+    const modelId = attempt.actualModelId ?? attempt.requestedModelId;
+    if (modelId) activeConcurrencyByModel.set(modelId, (activeConcurrencyByModel.get(modelId) ?? 0) + 1);
+  }
+  const budgetByConnectionId = new Map(budgets.map(budget => [budget.providerConnectionId, budget]));
+  const providerContexts = connections
+    .filter(connection => connection.provider !== "chatgpt_plus_manual")
+    .map(connection => {
+      const budget = budgetByConnectionId.get(connection.id);
+      return {
+        provider: connection.provider as "opencode_go" | "openai_api" | "local",
+        availableUsd: budget ? asNumber(budget.limitUsd) - asNumber(budget.consumedUsd) - asNumber(budget.reservedUsd) : undefined,
+        connectionState: connection.connectionState,
+        secretState: connection.secretState,
+      };
+    });
+  const routing = buildUnifiedRoutePlan({
+    requirements: input.requirements,
+    models: models.map(model => ({
+      provider: model.provider,
+      modelId: model.modelId,
+      displayName: model.displayName,
+      inputPerMillionUsd: asNumber(model.inputPerMillionUsd),
+      outputPerMillionUsd: asNumber(model.outputPerMillionUsd),
+      scarcityFactor: asNumber(model.scarcityFactor),
+      maxConcurrency: Math.max(0, model.maxConcurrency - (activeConcurrencyByModel.get(model.modelId) ?? 0)),
+      activeConcurrency: activeConcurrencyByModel.get(model.modelId) ?? 0,
+      maxContextTokens: model.maxContextTokens,
+      capability: model.capability,
+    })),
+    routeMode: input.routeMode,
+    requestedModelId: input.requestedModelId,
+    estimatedCostUsd: input.estimatedCostUsd,
+    providerContexts,
+  });
+  const selectedConnection = connections.find(connection => connection.provider === routing.selectedProvider);
+  const selectedBudget = selectedConnection ? budgetByConnectionId.get(selectedConnection.id) : budgets[0];
+  const budgetState = selectedBudget?.state ?? "GREEN";
+  const availableUsd = selectedBudget ? asNumber(selectedBudget.limitUsd) - asNumber(selectedBudget.consumedUsd) - asNumber(selectedBudget.reservedUsd) : 0;
+  const baseDecision = routing.blockedByCapability || routing.blockedByBudget
+    ? "HOLD" as const
+    : getAdmissionDecision({ priority: input.priority, routeMode: input.routeMode, estimatedCostUsd: input.estimatedCostUsd, availableUsd, dynamicReserveUsd: asNumber(selectedBudget?.dynamicReserveUsd), budgetState });
+  const scenarioDecision = input.scenario === "rate_limit" || input.scenario === "timeout" || input.scenario === "context_overflow"
+    ? "QUEUE" as const
+    : input.scenario === "quota_low"
+      ? input.routeMode === "strict" ? "HOLD" as const : "MIGRATE" as const
+      : baseDecision;
+  const scenarioReason = input.scenario === "rate_limit"
+    ? "Route Lab 场景注入 RATE_LIMIT：服务端建议受退避时间约束地排队，不发起真实请求。"
+    : input.scenario === "quota_low"
+      ? "Route Lab 场景注入共享额度低：严格模式保持暂停，其他模式仅建议能力合格的迁移候选。"
+      : input.scenario === "timeout"
+        ? "Route Lab 场景注入 TIMEOUT：服务端建议应用输出与工具降级配置后排队。"
+        : input.scenario === "context_overflow"
+          ? "Route Lab 场景注入 CONTEXT_OVERFLOW：服务端建议应用上下文压缩与分块配置后排队。"
+          : routing.reason;
+  const inserted = await db.insert(routePolicyEvaluations).values({
+    workspaceId: input.workspaceId,
+    priority: input.priority,
+    routeMode: input.routeMode,
+    scenario: input.scenario,
+    requirements: input.requirements,
+    estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
+    requestedModelId: input.requestedModelId,
+    selectedModelId: routing.recommendedModelId,
+    admissionDecision: scenarioDecision,
+    budgetState,
+    reason: scenarioReason,
+    routePlan: routing.routePlan,
+  });
+  return { evaluationId: Number(inserted[0].insertId), decision: scenarioDecision, budgetState, availableUsd, selectedModelId: routing.recommendedModelId, reason: scenarioReason, routePlan: routing.routePlan, providerCallsDisabled: true };
 }
 
 export async function claimTaskForLocalExecution(input: { workspaceId: number; taskId: number }) {

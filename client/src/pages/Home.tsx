@@ -123,6 +123,7 @@ export default function Home() {
   const [createdInviteToken, setCreatedInviteToken] = useState<string | null>(null);
   const [acceptInviteOpen, setAcceptInviteOpen] = useState(false);
   const [candidateModelByDecision, setCandidateModelByDecision] = useState<Record<number, string>>({});
+  const [routeEvaluation, setRouteEvaluation] = useState<{ evaluationId: number; decision: "ADMIT" | "RESERVE" | "MIGRATE" | "QUEUE" | "HOLD"; budgetState: string; availableUsd: number; selectedModelId?: string; reason: string; providerCallsDisabled: boolean } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const bootstrap = trpc.quota.bootstrap.useMutation({
@@ -157,6 +158,13 @@ export default function Home() {
       if (activeWorkspaceId) utils.quota.dashboard.invalidate({ workspaceId: activeWorkspaceId });
     },
     onError: error => toast.error("任务未入队", { description: error.message }),
+  });
+  const evaluateRouteLab = trpc.quota.evaluateRouteLab.useMutation({
+    onSuccess: result => {
+      setRouteEvaluation(result);
+      toast.success("服务端路由评估已保存", { description: `评估 #${result.evaluationId} · ${result.decision}；未调用 provider。` });
+    },
+    onError: error => toast.error("Route Lab 评估未完成", { description: error.message }),
   });
   const recordAttempt = trpc.quota.recordAttempt.useMutation({
     onSuccess: result => {
@@ -244,12 +252,42 @@ export default function Home() {
     })[0];
   }, [data?.models, selected]);
   const routeSteps = useMemo(() => {
+    if (routeEvaluation) return [
+      `评估 #${routeEvaluation.evaluationId} 已写入服务端审计记录`,
+      `决策 ${routeEvaluation.decision} · 预算状态 ${routeEvaluation.budgetState} · 可用 ${formatUsd(routeEvaluation.availableUsd, 4)}`,
+      routeEvaluation.reason,
+      routeEvaluation.providerCallsDisabled ? "离线边界已确认：未发起任何 provider 请求" : "等待离线边界校验",
+    ];
     if (rateScenario === "rate_limit") return ["429 / RATE_LIMIT 已识别", "遵守 Retry-After 并把并发上限下调", "缩小输出和 Agent steps；任务保持原模型队列", "若冷却后仍失败，记录 fallback 候选"]; 
     if (rateScenario === "quota_low") return ["共享窗口进入 DRAIN_PROTECTION", "检查 P0/P1 预留，冻结 P2/P3 高成本调用", "先压缩上下文与任务范围", "仅在能力仍满足时迁移到较低成本模型"]; 
     if (rateScenario === "timeout") return ["TIMEOUT 已识别", "确认工具调用幂等状态", "无副作用任务采用指数退避重试", "持续超时才触发 provider 熔断与替代路由"]; 
     if (rateScenario === "context_overflow") return ["CONTEXT_OVERFLOW 已识别", "提取相关文件和函数级上下文", "压缩引用，限制输出长度", "重新评估模型上下文能力后再尝试"]; 
     return ["能力硬约束筛选模型", "核对任务预算与共享窗口可用金额", "核对 P0/P1 预留和模型并发上限", "创建可审计 attempt，不调用真实 provider"]; 
-  }, [rateScenario]);
+  }, [rateScenario, routeEvaluation]);
+
+  useEffect(() => {
+    const submitRouteEvaluation = (event: MouseEvent) => {
+      const element = event.target instanceof Element ? event.target.closest(".route-lab-view .primary-action") : null;
+      if (!element || !element.textContent?.includes("Run scenario")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (!activeWorkspaceId) {
+        toast.error("请先登录并初始化工作区");
+        return;
+      }
+      evaluateRouteLab.mutate({
+        workspaceId: activeWorkspaceId,
+        priority,
+        routeMode: mode,
+        scenario: rateScenario,
+        requirements: selected.requirements,
+        estimatedCostUsd: selected.estimatedCost,
+        requestedModelId: routeModel?.modelId,
+      });
+    };
+    document.addEventListener("click", submitRouteEvaluation, true);
+    return () => document.removeEventListener("click", submitRouteEvaluation, true);
+  }, [activeWorkspaceId, evaluateRouteLab, mode, priority, rateScenario, routeModel?.modelId, selected]);
 
   const navItems: Array<{ id: View; label: string; icon: typeof Gauge }> = [
     { id: "overview", label: "连续性总览", icon: Gauge },
