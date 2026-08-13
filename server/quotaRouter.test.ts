@@ -104,4 +104,21 @@ describe("QuotaPilot V2 route decision state machine", () => {
     expect(transaction.update).toHaveBeenCalledTimes(1);
     expect(transaction.insert).toHaveBeenCalledTimes(1);
   });
+
+  it("returns a model's version trail through the protected history endpoint", async () => {
+    const rows = [
+      { id: 12, modelId: "deepseek-v4-pro", isActive: true, effectiveFrom: new Date("2026-08-13T00:00:00.000Z"), effectiveUntil: null },
+      { id: 11, modelId: "deepseek-v4-pro", isActive: false, effectiveFrom: new Date("2026-08-01T00:00:00.000Z"), effectiveUntil: new Date("2026-08-13T00:00:00.000Z") },
+    ];
+    const db = {
+      select: vi.fn(() => ({ from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => rows }) }) }) })),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    const caller = quotaRouter.createCaller(authenticatedContext());
+    const result = await caller.modelVersions({ workspaceId: 7, modelId: "deepseek-v4-pro" });
+
+    expect(result).toEqual(rows);
+    expect(result.map(version => version.isActive)).toEqual([true, false]);
+  });
 });

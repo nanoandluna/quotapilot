@@ -198,4 +198,118 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     expect(result).toMatchObject({ taskId: 44, attemptId: 202, claimKind: "p3_hard" });
     expect(transaction.insert).toHaveBeenCalledTimes(1);
   });
+
+  it("admits at most one concurrent P2 soft-to-hard claim against the same remaining shared budget", async () => {
+    let capacityClaimsRemaining = 1;
+    const buildTransaction = (taskId: number, attemptId: number) => {
+      const conditionalBudgetResult = capacityClaimsRemaining-- > 0 ? 1 : 0;
+      const updateResults = conditionalBudgetResult === 1 ? [1, 1, 1, 1] : [0];
+      return {
+      select: sequenceSelect([
+        [{ id: taskId, workspaceId: 7, status: "queued", estimatedCostUsd: "0.500000" }],
+        [{ id: attemptId, taskId, workspaceId: 7, status: "queued", provider: "opencode_go" }],
+        [{ id: taskId + 1000, taskId, providerBudgetId: 8, reservationKind: "soft", status: "RESERVED" }],
+        [{ id: 5, provider: "opencode_go" }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "1.0000", consumedUsd: "0.5000", reservedUsd: "0.0000" }],
+      ]),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: updateResults.shift() ?? 1 }] })) })),
+    };
+    };
+    const transactions = [buildTransaction(60, 260), buildTransaction(61, 261)];
+    const db = {
+      transaction: vi.fn((work: (tx: (typeof transactions)[number]) => Promise<unknown>) => work(transactions.shift()!)),
+      select: sequenceSelect([
+        [{ id: 7, researchPhase: "development" }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "1.0000", consumedUsd: "0.5000", reservedUsd: "0.5000", dynamicReserveUsd: "0", resetAt: new Date("2026-08-13T18:00:00.000Z"), state: "GREEN" }],
+        [], [], [], [], [],
+      ]),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    const outcomes = await Promise.allSettled([
+      claimTaskForLocalExecution({ workspaceId: 7, taskId: 60 }),
+      claimTaskForLocalExecution({ workspaceId: 7, taskId: 61 }),
+    ]);
+
+    expect(outcomes.filter(outcome => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter(outcome => outcome.status === "rejected")).toHaveLength(1);
+    expect(transactions).toHaveLength(0);
+  });
+
+  it("admits at most one concurrent P3 claim when neither task has a prior reservation", async () => {
+    let capacityClaimsRemaining = 1;
+    const buildP3Transaction = (taskId: number, attemptId: number) => {
+      const conditionalBudgetResult = capacityClaimsRemaining-- > 0 ? 1 : 0;
+      const updateResults = conditionalBudgetResult === 1 ? [1, 1, 1] : [0];
+      return {
+        select: sequenceSelect([
+          [{ id: taskId, workspaceId: 7, status: "queued", estimatedCostUsd: "0.500000" }],
+          [{ id: attemptId, taskId, workspaceId: 7, status: "queued", provider: "opencode_go" }],
+          [],
+          [{ id: 5, provider: "opencode_go" }],
+          [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "1.0000", consumedUsd: "0.5000", reservedUsd: "0.0000" }],
+        ]),
+        update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: updateResults.shift() ?? 1 }] })) })),
+        insert: vi.fn(() => ({ values: async () => undefined })),
+      };
+    };
+    const transactions = [buildP3Transaction(70, 270), buildP3Transaction(71, 271)];
+    const db = {
+      transaction: vi.fn((work: (tx: (typeof transactions)[number]) => Promise<unknown>) => work(transactions.shift()!)),
+      select: sequenceSelect([
+        [{ id: 7, researchPhase: "development" }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "1.0000", consumedUsd: "0.5000", reservedUsd: "0.5000", dynamicReserveUsd: "0", resetAt: new Date("2026-08-13T18:00:00.000Z"), state: "GREEN" }],
+        [], [], [], [], [],
+      ]),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    const outcomes = await Promise.allSettled([
+      claimTaskForLocalExecution({ workspaceId: 7, taskId: 70 }),
+      claimTaskForLocalExecution({ workspaceId: 7, taskId: 71 }),
+    ]);
+
+    expect(outcomes.filter(outcome => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter(outcome => outcome.status === "rejected")).toHaveLength(1);
+  });
+
+  it("shares the same execution-time capacity between a P2 soft reservation and a P3 best-effort task", async () => {
+    let capacityClaimsRemaining = 1;
+    const buildTransaction = (taskId: number, attemptId: number, reservationKind: "soft" | undefined) => {
+      const conditionalBudgetResult = capacityClaimsRemaining-- > 0 ? 1 : 0;
+      const updateResults = conditionalBudgetResult === 1 ? (reservationKind ? [1, 1, 1, 1] : [1, 1, 1]) : [0];
+      return {
+        select: sequenceSelect([
+          [{ id: taskId, workspaceId: 7, status: "queued", estimatedCostUsd: "0.500000" }],
+          [{ id: attemptId, taskId, workspaceId: 7, status: "queued", provider: "opencode_go" }],
+          reservationKind ? [{ id: taskId + 1000, taskId, providerBudgetId: 8, reservationKind, status: "RESERVED" }] : [],
+          [{ id: 5, provider: "opencode_go" }],
+          [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "1.0000", consumedUsd: "0.5000", reservedUsd: "0.0000" }],
+        ]),
+        update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: updateResults.shift() ?? 1 }] })) })),
+        insert: vi.fn(() => ({ values: async () => undefined })),
+      };
+    };
+    const transactions = [buildTransaction(80, 280, "soft"), buildTransaction(81, 281, undefined)];
+    const db = {
+      transaction: vi.fn((work: (tx: (typeof transactions)[number]) => Promise<unknown>) => work(transactions.shift()!)),
+      select: sequenceSelect([
+        [{ id: 7, researchPhase: "development" }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "1.0000", consumedUsd: "0.5000", reservedUsd: "0.5000", dynamicReserveUsd: "0", resetAt: new Date("2026-08-13T18:00:00.000Z"), state: "GREEN" }],
+        [], [], [], [], [],
+      ]),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+    };
+    doubles.getDb.mockResolvedValue(db);
+
+    const outcomes = await Promise.allSettled([
+      claimTaskForLocalExecution({ workspaceId: 7, taskId: 80 }),
+      claimTaskForLocalExecution({ workspaceId: 7, taskId: 81 }),
+    ]);
+
+    expect(outcomes.filter(outcome => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter(outcome => outcome.status === "rejected")).toHaveLength(1);
+  });
 });

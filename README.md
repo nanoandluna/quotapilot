@@ -17,9 +17,11 @@ QuotaPilot 提供以下本地优先能力。
 | 任务与账本 | 为任务、attempt、预算预留和结果类别记录可审计的执行轨迹。 |
 | 路由决策 | 保存准入阈值、预算快照、推荐动作、迁移目标和人工交接记录。 |
 | 统一 Route Plan | 对能力、最大上下文、provider 连接、共享可用额度和并发槽位留下逐候选审计证据。 |
+| 版本化模型注册表 | 为价格、能力、来源、核验时间与有效期保留历史版本；路由仅读取当前 `ACTIVE` 版本。 |
 | 状态机安全 | 路由决策使用单次消费语义；迁移时服务端会重新验证候选模型、连接、额度与并发。 |
 | 软硬预留 | P0/P1 预先硬锁定额度；P2 保留软意图并在领取时升级；P3 只在实际领取前作硬额度检查。 |
 | 离线领取 | `Claim locally` 只推进本地 task/attempt 状态并执行预算二次准入，绝不发送 provider 请求。 |
+| 团队邀请 | 以一次性 token 创建、投递和接受邀请；接受时必须匹配受邀邮箱，并留下接受主体与时间。 |
 | 团队权限 | 支持 owner、admin、researcher、reviewer 和 viewer 五类工作区角色。 |
 
 ## 明确边界
@@ -52,6 +54,8 @@ pnpm build
 默认情况下，QuotaPilot 运行在**离线本地导入模式**：它不会主动调用 OpenCode、OpenAI 或 ChatGPT Plus。用户可以通过 CSV/JSON 导入历史消耗，并使用手工账本结算任务。
 
 当你具备相应权限后，可在服务器端配置 `OPENCODE_GO_API_KEY` 与 `OPENAI_ADMIN_API_KEY` 来启用 provider 级同步。请勿把任何 API Key、数据库连接字符串、用户导入文件或运行日志提交到仓库。ChatGPT Plus 与 OpenAI API 用量彼此独立；Plus 应作为人工研究救援通道，而非服务器自动化 provider。
+
+OpenCode Go 的官方说明公开了共享美元窗口、可用模型目录和模型 metadata 端点；QuotaPilot 当前把该来源保存为模型策略证据，但在未获得真实 Adapter 凭据与可核验 metadata 前，**不会猜测或硬编码未知的上下文容量**。[OpenCode Go 官方文档](https://opencode.ai/docs/go/)
 
 ## 数据与科研结果
 

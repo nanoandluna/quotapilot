@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getReservationKind, needsNewModelVersion, parseUsageImport, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels } from "./quotaService";
+import { describe, expect, it, vi } from "vitest";
+import { buildUnifiedRoutePlan, calculateBudgetState, getAdmissionDecision, getReservationKind, needsNewModelVersion, parseUsageImport, resolveBudgetResetAt, resolveTaskRouting, scoreCandidateModels, syncWorkspacePolicyModel } from "./quotaService";
 
 describe("QuotaPilot V2 budget engine", () => {
   it("enters drain protection when the conservative burn rate exhausts budget before reset", () => {
@@ -89,6 +89,23 @@ describe("QuotaPilot V2 budget engine", () => {
     const current = { inputPerMillionUsd: "0.2", outputPerMillionUsd: "0.4", cacheReadPerMillionUsd: "0.02", scarcityFactor: "0.5", maxConcurrency: 2, capability: desired.capability, pricingVersion: "opencode-go-policy-2026-08-13", capabilityVersion: "opencode-go-policy-2026-08-13" };
     expect(needsNewModelVersion(current, desired)).toBe(false);
     expect(needsNewModelVersion({ ...current, maxConcurrency: 1 }, desired)).toBe(true);
+  });
+
+  it("closes a changed active model version and inserts a new current version", async () => {
+    const oldVersion = { id: 10, inputPerMillionUsd: "0.2", outputPerMillionUsd: "0.4", cacheReadPerMillionUsd: "0.02", scarcityFactor: "0.5", maxConcurrency: 1, capability: { code: 8, reasoning: 8, longContext: 8, vision: 1, toolUse: 8, chinese: 8, research: 8, agent: 8, speed: 8, reliability: 8 }, pricingVersion: "opencode-go-policy-2026-08-13", capabilityVersion: "opencode-go-policy-2026-08-13" };
+    const closeSet = vi.fn(() => ({ where: async () => undefined }));
+    const insertValues = vi.fn(async () => undefined);
+    const db = {
+      select: () => ({ from: () => ({ where: () => ({ limit: async () => [oldVersion] }) }) }),
+      update: vi.fn(() => ({ set: closeSet })),
+      insert: vi.fn(() => ({ values: insertValues })),
+      transaction: vi.fn((work: (tx: unknown) => Promise<unknown>) => work(db)),
+    };
+    const result = await syncWorkspacePolicyModel(db, { modelId: "sample", displayName: "Sample", input: "0.2", output: "0.4", cacheRead: "0.02", scarcity: "0.5", concurrency: 2, capability: oldVersion.capability });
+    expect(result).toMatchObject({ action: "replaced", previousVersionId: 10 });
+    expect(db.transaction).toHaveBeenCalledTimes(1);
+    expect(closeSet).toHaveBeenCalledWith(expect.objectContaining({ isActive: false, effectiveUntil: expect.any(Date) }));
+    expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({ modelId: "sample", effectiveFrom: expect.any(Date), pricingVersion: "opencode-go-policy-2026-08-13" }));
   });
 
   it("filters models that cannot meet research requirements before ranking cost and scarcity", () => {

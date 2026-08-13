@@ -46,6 +46,12 @@ export const quotaRouter = router({
     await requireWorkspaceRole(input.workspaceId, ctx.user.id);
     return listWorkspaceDashboard(input.workspaceId);
   }),
+  modelVersions: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), modelId: z.string().max(160).optional() })).query(async ({ ctx, input }) => {
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id);
+    const db = await getDb();
+    if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+    return db.select().from(modelRegistry).where(input.modelId ? eq(modelRegistry.modelId, input.modelId) : undefined).orderBy(desc(modelRegistry.effectiveFrom)).limit(60);
+  }),
   importUsage: protectedProcedure.input(z.object({
     workspaceId: z.number().int().positive(),
     filename: z.string().min(1).max(255),

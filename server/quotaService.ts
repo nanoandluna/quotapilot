@@ -86,6 +86,52 @@ export function needsNewModelVersion(current: {
     || current.capabilityVersion !== OPENCODE_GO_POLICY_VERSION;
 }
 
+async function syncWorkspacePolicyModelInTransaction(db: any, model: ModelSeed) {
+  const verifiedAt = new Date();
+  const activeVersion = (await db.select().from(modelRegistry).where(and(
+    eq(modelRegistry.provider, "opencode_go"),
+    eq(modelRegistry.modelId, model.modelId),
+    eq(modelRegistry.isActive, true),
+  )).limit(1))[0];
+  if (activeVersion && !needsNewModelVersion(activeVersion, model)) {
+    await db.update(modelRegistry).set({
+      metadataVerifiedAt: verifiedAt,
+      metadataSourceUrl: OPENCODE_GO_DOCS_URL,
+      updatedAt: verifiedAt,
+    }).where(eq(modelRegistry.id, activeVersion.id));
+    return { action: "refreshed" as const, previousVersionId: activeVersion.id };
+  }
+  if (activeVersion) {
+    await db.update(modelRegistry).set({
+      isActive: false,
+      effectiveUntil: verifiedAt,
+      updatedAt: verifiedAt,
+    }).where(eq(modelRegistry.id, activeVersion.id));
+  }
+  await db.insert(modelRegistry).values({
+    provider: "opencode_go",
+    modelId: model.modelId,
+    displayName: model.displayName,
+    inputPerMillionUsd: model.input,
+    outputPerMillionUsd: model.output,
+    cacheReadPerMillionUsd: model.cacheRead,
+    scarcityFactor: model.scarcity,
+    maxConcurrency: model.concurrency,
+    capability: model.capability,
+    source: "workspace_policy",
+    pricingVersion: OPENCODE_GO_POLICY_VERSION,
+    capabilityVersion: OPENCODE_GO_POLICY_VERSION,
+    metadataVerifiedAt: verifiedAt,
+    metadataSourceUrl: OPENCODE_GO_DOCS_URL,
+    effectiveFrom: verifiedAt,
+  });
+  return { action: activeVersion ? "replaced" as const : "inserted" as const, previousVersionId: activeVersion?.id };
+}
+
+export async function syncWorkspacePolicyModel(db: any, model: ModelSeed) {
+  return db.transaction((tx: any) => syncWorkspacePolicyModelInTransaction(tx, model));
+}
+
 const PHASE_RESERVE_RATIO = {
   development: 0.1,
   paper: 0.2,
@@ -501,44 +547,7 @@ async function seedWorkspaceDefaults(workspaceId: number) {
   }
 
   for (const model of OPEN_CODE_MODELS) {
-    const verifiedAt = new Date();
-    const activeVersion = (await db.select().from(modelRegistry).where(and(
-      eq(modelRegistry.provider, "opencode_go"),
-      eq(modelRegistry.modelId, model.modelId),
-      eq(modelRegistry.isActive, true),
-    )).limit(1))[0];
-    if (activeVersion && !needsNewModelVersion(activeVersion, model)) {
-      await db.update(modelRegistry).set({
-        metadataVerifiedAt: verifiedAt,
-        metadataSourceUrl: OPENCODE_GO_DOCS_URL,
-        updatedAt: verifiedAt,
-      }).where(eq(modelRegistry.id, activeVersion.id));
-      continue;
-    }
-    if (activeVersion) {
-      await db.update(modelRegistry).set({
-        isActive: false,
-        effectiveUntil: verifiedAt,
-        updatedAt: verifiedAt,
-      }).where(eq(modelRegistry.id, activeVersion.id));
-    }
-    await db.insert(modelRegistry).values({
-      provider: "opencode_go",
-      modelId: model.modelId,
-      displayName: model.displayName,
-      inputPerMillionUsd: model.input,
-      outputPerMillionUsd: model.output,
-      cacheReadPerMillionUsd: model.cacheRead,
-      scarcityFactor: model.scarcity,
-      maxConcurrency: model.concurrency,
-      capability: model.capability,
-      source: "workspace_policy",
-      pricingVersion: OPENCODE_GO_POLICY_VERSION,
-      capabilityVersion: OPENCODE_GO_POLICY_VERSION,
-      metadataVerifiedAt: verifiedAt,
-      metadataSourceUrl: OPENCODE_GO_DOCS_URL,
-      effectiveFrom: verifiedAt,
-    });
+    await syncWorkspacePolicyModel(db, model);
   }
 
   await db.insert(schedulerSettings).values({ workspaceId }).onDuplicateKeyUpdate({ set: { updatedAt: new Date() } });
