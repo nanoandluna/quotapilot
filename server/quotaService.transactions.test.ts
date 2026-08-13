@@ -9,6 +9,7 @@ vi.mock("./db", () => ({ getDb: doubles.getDb }));
 vi.mock("./storage", () => ({ storagePut: doubles.storagePut }));
 
 import { claimInitialHardReservation, claimTaskForLocalExecution, listWorkspaceDashboard, queueTaskRetry, recordTaskAttemptExecution, saveUsageImport } from "./quotaService";
+import { taskEvents } from "../drizzle/schema";
 
 function selectRows<T>(rows: T[]) {
   const query = {
@@ -198,6 +199,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
       expect(result).toMatchObject({ taskStatus: "queued", retryScheduledAt: expect.any(Date) });
       expect(transactionSets.mock.calls[1]?.[0]).toMatchObject({ status: "queued", completedAt: null });
       expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ attemptNumber: 2, retryNotBefore: expect.any(Date), status: "queued" }));
+      expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ kind: "retry_queued", taskId: 100, attemptId: null }));
       expect(transactionSets.mock.calls[3]?.[0]).toMatchObject({ connectionState: "degraded", circuitReason: "RATE_LIMIT", circuitOpenUntil: expect.any(Date) });
     }
     expect(transactionSets.mock.calls[1]?.[0]).toMatchObject({ actualCostUsd: "0.100000", remainingBudgetUsd: "1.900000" });
@@ -215,6 +217,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
       actualCostUsd: "0.100000",
     }));
     expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ source: "task_attempt", externalRef: "attempt:200:settled" }));
+    expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ kind: "attempt_settled", taskId: 100, attemptId: 200, payload: expect.objectContaining({ status, taskStatus: result.taskStatus }) }));
     expect(snapshotValues).toHaveBeenCalledWith(expect.objectContaining({ providerBudgetId: 8, window: "five_hour", limitUsd: "10.0000", state: "GREEN" }));
   });
 
@@ -465,6 +468,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
 
     await expect(queueTaskRetry({ workspaceId: 7, taskId: 102 })).resolves.toMatchObject({ taskId: 102, attemptId: 202, attemptNumber: 2 });
     expect(attemptValues).toHaveBeenCalledWith(expect.objectContaining({ attemptNumber: 2, status: "queued" }));
+    expect(attemptValues).toHaveBeenCalledWith(expect.objectContaining({ kind: "retry_queued", taskId: 102, attemptId: 202, payload: expect.objectContaining({ source: "manual_retry" }) }));
 
     const limitedTransaction = {
       select: sequenceSelect([
@@ -491,6 +495,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
         [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "12.0000", consumedUsd: "1.0000", reservedUsd: "0.5000" }],
       ]),
       update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })) })),
+      insert: vi.fn(() => ({ values: async () => undefined })),
     };
     const db = {
       transaction: vi.fn(async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)),
@@ -513,6 +518,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     expect(result).toMatchObject({ taskId: 42, attemptId: 200, claimKind: "soft_upgraded" });
     expect(transaction.update).toHaveBeenCalledTimes(4);
     expect(transaction.select).toHaveBeenCalledTimes(5);
+    expect(transaction.insert).toHaveBeenCalledWith(taskEvents);
   });
 
   it("does not start a soft-reserved task when the execution-time budget claim loses capacity", async () => {
@@ -569,7 +575,8 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     const result = await claimTaskForLocalExecution({ workspaceId: 7, taskId: 44 });
 
     expect(result).toMatchObject({ taskId: 44, attemptId: 202, claimKind: "p3_hard", executionPlan: { contextReductionRatio: 0.7, outputReductionRatio: 0.8, chunkInput: true } });
-    expect(transaction.insert).toHaveBeenCalledTimes(1);
+    expect(transaction.insert).toHaveBeenCalledTimes(2);
+    expect(transaction.insert).toHaveBeenCalledWith(taskEvents);
   });
 
   it("blocks a claim when the provider-level concurrency budget is full", async () => {
@@ -648,6 +655,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
         [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "1.0000", consumedUsd: "0.5000", reservedUsd: "0.0000" }],
       ]),
       update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: updateResults.shift() ?? 1 }] })) })),
+      insert: vi.fn(() => ({ values: async () => undefined })),
     };
     };
     const transactions = [buildTransaction(60, 260), buildTransaction(61, 261)];

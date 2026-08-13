@@ -1345,6 +1345,13 @@ export async function claimTaskForLocalExecution(input: { workspaceId: number; t
       await releaseConcurrency();
       throw new TRPCError({ code: "CONFLICT", message: "attempt 已被其他执行者领取。" });
     }
+    await tx.insert(taskEvents).values({
+      workspaceId: input.workspaceId,
+      taskId: task.id,
+      attemptId: attempt.id,
+      kind: "attempt_claimed",
+      payload: { attemptNumber: attempt.attemptNumber, provider: attempt.provider, claimKind, modelRegistryId: concurrencyModel?.id ?? attempt.modelRegistryId, executionPlan: attempt.executionPlan ?? null },
+    });
     return { taskId: task.id, attemptId: attempt.id, claimKind, provider: attempt.provider ?? "unknown", executionPlan: attempt.executionPlan ?? null };
   });
   await refreshWorkspaceBudgets(input.workspaceId);
@@ -1442,7 +1449,7 @@ export async function recordTaskAttemptExecution(input: {
     });
     await tx.update(researchTasks).set({ actualCostUsd: nextActualCostUsd.toFixed(6), remainingBudgetUsd: Math.max(0, cumulativeCostCapUsd - nextActualCostUsd).toFixed(6), resultClass: finalResultClass, status: finalTaskStatus, queuedAt: canScheduleRetry ? new Date() : task.queuedAt, completedAt, updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
     if (canScheduleRetry) {
-      await tx.insert(taskAttempts).values({
+      const retryAttempt = await tx.insert(taskAttempts).values({
         workspaceId: input.workspaceId,
         taskId: task.id,
         attemptNumber: Number(attemptNumber) + 1,
@@ -1456,6 +1463,13 @@ export async function recordTaskAttemptExecution(input: {
         executionPlan: failureExecutionPlan,
         retryNotBefore,
         status: "queued",
+      });
+      await tx.insert(taskEvents).values({
+        workspaceId: input.workspaceId,
+        taskId: task.id,
+        attemptId: retryAttempt?.[0]?.insertId ? Number(retryAttempt[0].insertId) : null,
+        kind: "retry_queued",
+        payload: { attemptNumber: Number(attemptNumber) + 1, retryNotBefore: retryNotBefore?.toISOString() ?? null, failureReason, executionPlan: failureExecutionPlan },
       });
     }
     if (failurePolicy && !canScheduleRetry && failurePolicy.recommendedAction !== "queue") {
@@ -1498,6 +1512,13 @@ export async function recordTaskAttemptExecution(input: {
       await tx.update(providerConnections).set({ connectionState: "degraded", circuitOpenUntil, circuitReason: failureReason, updatedAt: new Date() }).where(eq(providerConnections.id, connection.id));
     }
     await tx.insert(usageEvents).values({ workspaceId: input.workspaceId, providerConnectionId: connection?.id, modelRegistryId: attempt.modelRegistryId, provider: attempt.provider ?? "opencode_go", modelId: input.actualModelId, tokens: tokenSnapshot, estimatedCostUsd: attempt.estimatedCostUsd, actualCostUsd: input.actualCostUsd.toFixed(6), budgetWindow: "five_hour", costUnit: "USD", costBasis: "mixed", source: "task_attempt", occurredAt: new Date(), externalRef: `attempt:${attempt.id}:settled` });
+    await tx.insert(taskEvents).values({
+      workspaceId: input.workspaceId,
+      taskId: task.id,
+      attemptId: attempt.id,
+      kind: "attempt_settled",
+      payload: { status: input.status, actualModelId: input.actualModelId, actualCostUsd: input.actualCostUsd, fallback: didFallback, fallbackReason, failureReason, resultClass: finalResultClass, taskStatus: finalTaskStatus, retryScheduledAt: retryNotBefore?.toISOString() ?? null },
+    });
     return { taskStatus: finalTaskStatus, resultClass: finalResultClass, reservationStatus, failurePolicy, failureExecutionPlan, retryScheduledAt: retryNotBefore };
   });
   await refreshWorkspaceBudgets(input.workspaceId);
@@ -1536,6 +1557,13 @@ export async function queueTaskRetry(input: { workspaceId: number; taskId: numbe
       status: "queued",
     });
     await tx.update(researchTasks).set({ status: "queued", queuedAt: new Date(), completedAt: null, updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
+    await tx.insert(taskEvents).values({
+      workspaceId: input.workspaceId,
+      taskId: task.id,
+      attemptId: Number(insertResult[0].insertId),
+      kind: "retry_queued",
+      payload: { attemptNumber: nextAttemptNumber, source: "manual_retry", requestedModelId: task.requestedModelId, provider: previousAttempt?.provider ?? "opencode_go" },
+    });
     return { taskId: task.id, attemptId: Number(insertResult[0].insertId), attemptNumber: nextAttemptNumber };
   });
 }
