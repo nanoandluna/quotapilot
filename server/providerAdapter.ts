@@ -24,6 +24,8 @@ export type ProviderExecutionRequest = {
     maxToolCalls: number | null;
     maxAgentSteps: number | null;
     chunkInput: boolean;
+    splitTask: boolean;
+    switchModel: boolean;
     preserveRequestedModel: boolean;
   } | null;
 };

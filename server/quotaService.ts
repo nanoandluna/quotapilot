@@ -39,6 +39,7 @@ export type FailureExecutionPlan = {
   maxAgentSteps: number | null;
   chunkInput: boolean;
   splitTask: boolean;
+  switchModel: boolean;
   preserveRequestedModel: boolean;
 };
 
@@ -49,7 +50,7 @@ export function getFailurePolicy(domain: FailureDomain, priority: "P0" | "P1" | 
     RATE_LIMIT: { recommendedAction: "queue", retryAfterSeconds: strictResearch ? 15 : 30, retryMode: "backoff", circuitScope: "provider", degradationSteps: ["指数退避", "降低并发", "保留请求语义"], requiresHumanHandoff: false },
     TIMEOUT: { recommendedAction: "queue", retryAfterSeconds: 10, retryMode: "backoff", circuitScope: "model", degradationSteps: ["缩小输出上限", "拆分任务", "降低 Agent 步数"], requiresHumanHandoff: false },
     PROVIDER_ERROR: { recommendedAction: "queue", retryAfterSeconds: 60, retryMode: "backoff", circuitScope: "provider", degradationSteps: ["短路异常 provider", "等待健康检查恢复", "不静默切换正式结果"], requiresHumanHandoff: strictResearch },
-    MODEL_UNAVAILABLE: { recommendedAction: strictResearch ? "manual_handoff" : "migrate", retryAfterSeconds: null, retryMode: "after_remediation", circuitScope: "model", degradationSteps: ["验证候选模型能力", "重新执行额度与上下文准入", "标记 fallback 或 recovery"], requiresHumanHandoff: strictResearch },
+    MODEL_UNAVAILABLE: { recommendedAction: strictResearch ? "manual_handoff" : "migrate", retryAfterSeconds: null, retryMode: "after_remediation", circuitScope: "model", degradationSteps: ["验证候选模型能力", "切换至能力验证候选模型", "重新执行额度与上下文准入", "标记 fallback 或 recovery"], requiresHumanHandoff: strictResearch },
     CONTEXT_OVERFLOW: { recommendedAction: "queue", retryAfterSeconds: 0, retryMode: "backoff", circuitScope: "task", degradationSteps: ["压缩上下文", "分块输入", "减少工具输出"], requiresHumanHandoff: false },
     TOOL_ERROR: { recommendedAction: "queue", retryAfterSeconds: 20, retryMode: "backoff", circuitScope: "tool", degradationSteps: ["缩小工具调用", "重试幂等步骤", "隔离失败工具"], requiresHumanHandoff: false },
     UNKNOWN: { recommendedAction: "manual_handoff", retryAfterSeconds: null, retryMode: "none", circuitScope: "unknown", degradationSteps: ["保留失败证据", "人工复核后再重试"], requiresHumanHandoff: true },
@@ -58,11 +59,12 @@ export function getFailurePolicy(domain: FailureDomain, priority: "P0" | "P1" | 
 }
 
 export function getFailureExecutionPlan(domain: FailureDomain): FailureExecutionPlan {
-  const baseline: FailureExecutionPlan = { contextReductionRatio: 1, outputReductionRatio: 1, maxToolCalls: null, maxAgentSteps: null, chunkInput: false, splitTask: false, preserveRequestedModel: true };
+  const baseline: FailureExecutionPlan = { contextReductionRatio: 1, outputReductionRatio: 1, maxToolCalls: null, maxAgentSteps: null, chunkInput: false, splitTask: false, switchModel: false, preserveRequestedModel: true };
   const plans: Partial<Record<FailureDomain, FailureExecutionPlan>> = {
     TIMEOUT: { ...baseline, outputReductionRatio: 0.7, maxToolCalls: 3, maxAgentSteps: 4, splitTask: true },
     CONTEXT_OVERFLOW: { ...baseline, contextReductionRatio: 0.7, outputReductionRatio: 0.8, maxToolCalls: 3, maxAgentSteps: 3, chunkInput: true, splitTask: true },
     TOOL_ERROR: { ...baseline, maxToolCalls: 2, maxAgentSteps: 3 },
+    MODEL_UNAVAILABLE: { ...baseline, switchModel: true, preserveRequestedModel: false },
   };
   return plans[domain] ?? baseline;
 }
@@ -1491,6 +1493,13 @@ export async function recordTaskAttemptExecution(input: {
         recommendedAction: failurePolicy.recommendedAction,
         selectedModelId: task.requestedModelId,
         requiresHumanHandoff: failurePolicy.requiresHumanHandoff,
+      });
+      await tx.insert(taskEvents).values({
+        workspaceId: input.workspaceId,
+        taskId: task.id,
+        attemptId: attempt.id,
+        kind: "route_decision",
+        payload: { admissionDecision, recommendedAction: failurePolicy.recommendedAction, failureReason, executionPlan: failureExecutionPlan, requiresHumanHandoff: failurePolicy.requiresHumanHandoff },
       });
     }
     const reservationStatus = input.status === "completed" ? "CONSUMED" : "RELEASED";

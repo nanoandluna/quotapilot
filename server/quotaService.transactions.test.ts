@@ -314,6 +314,7 @@ describe("QuotaPilot V0.2 transaction guards", () => {
 
     expect(result).toMatchObject({ taskStatus: "paused", failurePolicy: { recommendedAction: "migrate", retryMode: "after_remediation" } });
     expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({ admissionDecision: "MIGRATE", recommendedAction: "migrate", requiresHumanHandoff: false }));
+    expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({ kind: "route_decision", payload: expect.objectContaining({ failureReason: "MODEL_UNAVAILABLE", executionPlan: expect.objectContaining({ switchModel: true, preserveRequestedModel: false }) }) }));
   });
 
   it("queues a context-overflow retry with persisted executable compression constraints", async () => {

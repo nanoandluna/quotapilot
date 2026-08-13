@@ -71,6 +71,7 @@ export type AttemptExecutionPlan = {
   maxAgentSteps: number | null;
   chunkInput: boolean;
   splitTask: boolean;
+  switchModel: boolean;
   preserveRequestedModel: boolean;
 };
 

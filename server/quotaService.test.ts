@@ -109,6 +109,7 @@ describe("QuotaPilot V2 budget engine", () => {
     expect(getFailureExecutionPlan("CONTEXT_OVERFLOW")).toMatchObject({ splitTask: true, outputReductionRatio: 0.8, maxAgentSteps: 3 });
     expect(getFailureExecutionPlan("TIMEOUT")).toMatchObject({ splitTask: true, outputReductionRatio: 0.7, maxAgentSteps: 4 });
     expect(getFailureExecutionPlan("TOOL_ERROR")).toMatchObject({ maxToolCalls: 2, maxAgentSteps: 3 });
+    expect(getFailureExecutionPlan("MODEL_UNAVAILABLE")).toMatchObject({ switchModel: true, preserveRequestedModel: false });
   });
 
   it("advances expired reset windows according to policy while honoring future provider-reported reset times", () => {

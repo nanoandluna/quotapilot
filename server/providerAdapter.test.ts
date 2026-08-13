@@ -8,7 +8,7 @@ describe("QuotaPilot offline Provider Adapter", () => {
   });
 
   it("rejects execution even when an adapter instance exists", async () => {
-    await expect(getProviderAdapter("opencode_go").execute({ taskId: 1, attemptId: 2, modelId: "deepseek-v4-pro", idempotencyKey: "attempt-2" }))
+    await expect(getProviderAdapter("opencode_go").execute({ taskId: 1, attemptId: 2, modelId: "deepseek-v4-pro", idempotencyKey: "attempt-2", executionPlan: { contextReductionRatio: 1, outputReductionRatio: 1, maxToolCalls: null, maxAgentSteps: null, chunkInput: false, splitTask: false, switchModel: true, preserveRequestedModel: false } }))
       .rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
   });
 });
