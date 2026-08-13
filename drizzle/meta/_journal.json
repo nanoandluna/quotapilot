@@ -148,6 +148,13 @@
       "when": 1786632583032,
       "tag": "0020_light_lord_tyger",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "5",
+      "when": 1786632841444,
+      "tag": "0021_smiling_joystick",
+      "breakpoints": true
     }
   ]
 }

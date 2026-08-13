@@ -133,7 +133,7 @@ export const workspaceAuditLogs = mysqlTable("workspace_audit_logs", {
   id: int("id").autoincrement().primaryKey(),
   workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
   actorUserId: int("actorUserId").references(() => users.id, { onDelete: "set null" }),
-  action: mysqlEnum("auditAction", ["member_invited", "invite_accepted", "member_role_changed", "member_removed", "route_decision_acted", "task_claimed", "attempt_settled"]).notNull(),
+  action: mysqlEnum("auditAction", ["member_invited", "invite_accepted", "member_role_changed", "member_removed", "ownership_transferred", "route_decision_acted", "task_claimed", "attempt_settled"]).notNull(),
   targetType: varchar("targetType", { length: 48 }).notNull(),
   targetId: varchar("targetId", { length: 96 }),
   before: json("before"),

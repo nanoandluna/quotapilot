@@ -287,6 +287,7 @@ export const quotaRouter = router({
       if (!nextOwner[0]) throw new TRPCError({ code: "NOT_FOUND", message: "新的 owner 必须是当前工作区成员。" });
       await tx.update(workspaceMembers).set({ role: "admin", updatedAt: new Date() }).where(eq(workspaceMembers.id, currentOwner[0].id));
       await tx.update(workspaceMembers).set({ role: "owner", updatedAt: new Date() }).where(eq(workspaceMembers.id, nextOwner[0].id));
+      await tx.insert(workspaceAuditLogs).values({ workspaceId: input.workspaceId, actorUserId: ctx.user.id, action: "ownership_transferred", targetType: "workspace", targetId: String(input.workspaceId), before: { ownerUserId: ctx.user.id, role: "owner" }, after: { ownerUserId: input.newOwnerUserId, previousOwnerRole: "admin" } });
     });
     return { ok: true, previousOwnerUserId: ctx.user.id, newOwnerUserId: input.newOwnerUserId };
   }),

@@ -1,0 +1,1 @@
+ALTER TABLE `workspace_audit_logs` MODIFY COLUMN `auditAction` enum('member_invited','invite_accepted','member_role_changed','member_removed','ownership_transferred','route_decision_acted','task_claimed','attempt_settled') NOT NULL;
