@@ -134,4 +134,15 @@ export const quotaRouter = router({
     await db.update(workspaceMembers).set({ role: input.role as WorkspaceRole, updatedAt: new Date() }).where(and(eq(workspaceMembers.workspaceId, input.workspaceId), eq(workspaceMembers.userId, input.memberUserId)));
     return { ok: true };
   }),
+  removeMember: protectedProcedure.input(z.object({ workspaceId: z.number().int().positive(), memberUserId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "admin");
+    if (input.memberUserId === ctx.user.id) throw new TRPCError({ code: "BAD_REQUEST", message: "不能通过此操作移除当前账户；请先转移工作区拥有权。" });
+    const db = await getDb();
+    if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+    const member = (await db.select().from(workspaceMembers).where(and(eq(workspaceMembers.workspaceId, input.workspaceId), eq(workspaceMembers.userId, input.memberUserId))).limit(1))[0];
+    if (!member) throw new TRPCError({ code: "NOT_FOUND", message: "成员不存在。" });
+    if (member.role === "owner") throw new TRPCError({ code: "BAD_REQUEST", message: "不能移除工作区拥有者。" });
+    await db.delete(workspaceMembers).where(and(eq(workspaceMembers.workspaceId, input.workspaceId), eq(workspaceMembers.userId, input.memberUserId)));
+    return { ok: true };
+  }),
 });
