@@ -213,6 +213,22 @@ export const quotaRouter = router({
       }).where(and(eq(routeDecisions.id, decision.id), isNull(routeDecisions.actedAt)));
       if (consumed[0].affectedRows !== 1) throw new TRPCError({ code: "CONFLICT", message: "route decision 已被并发处理。" });
       await tx.update(researchTasks).set({ status, admissionDecision, requestedModelId, updatedAt: new Date() }).where(eq(researchTasks.id, task.id));
+      await tx.insert(taskEvents).values({
+        workspaceId: input.workspaceId,
+        taskId: task.id,
+        attemptId: decision.attemptId,
+        actorUserId: ctx.user.id,
+        kind: "route_decision",
+        payload: { decisionId: decision.id, action: input.action, admissionDecision, selectedModelId: input.action === "migrate" ? requestedModelId : decision.selectedModelId },
+      });
+      await tx.insert(taskEvents).values({
+        workspaceId: input.workspaceId,
+        taskId: task.id,
+        attemptId: decision.attemptId,
+        actorUserId: ctx.user.id,
+        kind: status === "queued" ? "task_resumed" : "task_paused",
+        payload: { source: "route_decision", decisionId: decision.id, action: input.action, status },
+      });
       return { ok: true, taskId: decision.taskId, status };
     });
   }),

@@ -169,9 +169,11 @@ describe("QuotaPilot V2 route decision state machine", () => {
       [],
     ];
     const updateSets = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const eventValues = vi.fn(async () => undefined);
     const transaction = {
       select: vi.fn(() => selectRows(rows.shift() ?? [])),
       update: vi.fn(() => ({ set: updateSets })),
+      insert: vi.fn(() => ({ values: eventValues })),
     };
     doubles.scoreCandidateModels.mockReturnValue([{ modelId: "deepseek-v4-pro" }]);
     doubles.getDb.mockResolvedValue({ transaction: vi.fn((work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)) });
@@ -187,6 +189,8 @@ describe("QuotaPilot V2 route decision state machine", () => {
       provider: "opencode_go",
       executionPlan: { preserveRequestedModel: false },
     });
+    expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ kind: "route_decision", actorUserId: 1, payload: expect.objectContaining({ action: "migrate", selectedModelId: "deepseek-v4-pro" }) }));
+    expect(eventValues).toHaveBeenCalledWith(expect.objectContaining({ kind: "task_resumed", actorUserId: 1, payload: expect.objectContaining({ source: "route_decision", status: "queued" }) }));
   });
 
   it("accepts a pending invite only for the invited email and binds the member transactionally", async () => {
