@@ -530,37 +530,37 @@ export default function Home() {
       ];
     if (rateScenario === "rate_limit")
       return [
-        "429 / RATE_LIMIT 已识别",
-        "遵守 Retry-After 并把并发上限下调",
-        "缩小输出和 Agent steps；任务保持原模型队列",
-        "若冷却后仍失败，记录 fallback 候选",
+        "预览（未审计）：429 / RATE_LIMIT 场景",
+        "预计遵守 Retry-After 并下调并发上限",
+        "预计缩小输出和 Agent steps；任务保持原模型队列",
+        "请运行服务端评估以写入实际建议与审计记录",
       ];
     if (rateScenario === "quota_low")
       return [
-        "共享窗口进入 DRAIN_PROTECTION",
-        "检查 P0/P1 预留，冻结 P2/P3 高成本调用",
-        "先压缩上下文与任务范围",
-        "仅在能力仍满足时迁移到较低成本模型",
+        "预览（未审计）：共享窗口额度低",
+        "预计检查 P0/P1 预留并冻结 P2/P3 高成本调用",
+        "预计先压缩上下文与任务范围",
+        "请运行服务端评估以确定是否允许迁移",
       ];
     if (rateScenario === "timeout")
       return [
-        "TIMEOUT 已识别",
-        "确认工具调用幂等状态",
-        "无副作用任务采用指数退避重试",
-        "持续超时才触发 provider 熔断与替代路由",
+        "预览（未审计）：TIMEOUT 场景",
+        "预计确认工具调用幂等状态",
+        "预计为无副作用任务应用指数退避",
+        "请运行服务端评估以写入熔断与重试计划",
       ];
     if (rateScenario === "context_overflow")
       return [
-        "CONTEXT_OVERFLOW 已识别",
-        "提取相关文件和函数级上下文",
-        "压缩引用，限制输出长度",
-        "重新评估模型上下文能力后再尝试",
+        "预览（未审计）：CONTEXT_OVERFLOW 场景",
+        "预计提取相关文件和函数级上下文",
+        "预计压缩引用并限制输出长度",
+        "请运行服务端评估以写入拆分与压缩计划",
       ];
     return [
-      "能力硬约束筛选模型",
-      "核对任务预算与共享窗口可用金额",
-      "核对 P0/P1 预留和模型并发上限",
-      "创建可审计 attempt，不调用真实 provider",
+      "预览（未审计）：能力硬约束候选筛选",
+      "预计核对任务预算与共享窗口可用金额",
+      "预计核对 P0/P1 预留和模型并发上限",
+      "请运行服务端评估以生成可审计 Route Plan",
     ];
   }, [rateScenario, routeEvaluation]);
 
@@ -568,41 +568,21 @@ export default function Home() {
     setRouteEvaluation(null);
   }, [mode, priority, rateScenario, selectedPreset]);
 
-  useEffect(() => {
-    const submitRouteEvaluation = (event: MouseEvent) => {
-      const element =
-        event.target instanceof Element
-          ? event.target.closest(".route-lab-view .primary-action")
-          : null;
-      if (!element || !element.textContent?.includes("Run scenario")) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (!activeWorkspaceId) {
-        toast.error("请先登录并初始化工作区");
-        return;
-      }
-      evaluateRouteLab.mutate({
-        workspaceId: activeWorkspaceId,
-        priority,
-        routeMode: mode,
-        scenario: rateScenario,
-        requirements: selected.requirements,
-        estimatedCostUsd: selected.estimatedCost,
-        requestedModelId: routeModel?.modelId,
-      });
-    };
-    document.addEventListener("click", submitRouteEvaluation, true);
-    return () =>
-      document.removeEventListener("click", submitRouteEvaluation, true);
-  }, [
-    activeWorkspaceId,
-    evaluateRouteLab,
-    mode,
-    priority,
-    rateScenario,
-    routeModel?.modelId,
-    selected,
-  ]);
+  const runRouteEvaluation = () => {
+    if (!activeWorkspaceId) {
+      toast.error("请先登录并初始化工作区");
+      return;
+    }
+    evaluateRouteLab.mutate({
+      workspaceId: activeWorkspaceId,
+      priority,
+      routeMode: mode,
+      scenario: rateScenario,
+      requirements: selected.requirements,
+      estimatedCostUsd: selected.estimatedCost,
+      requestedModelId: routeModel?.modelId,
+    });
+  };
 
   const navItems: Array<{ id: View; label: string; icon: typeof Gauge }> = [
     { id: "overview", label: "连续性总览", icon: Gauge },
@@ -1562,12 +1542,18 @@ export default function Home() {
                       <div className="section-kicker">ROUTER OUTPUT</div>
                       <h2>Execution guard</h2>
                     </div>
-                    <span className="route-status-stamp">SIMULATED</span>
+                    <span className="route-status-stamp">
+                      {routeEvaluation ? "AUDITED" : "PREVIEW"}
+                    </span>
                   </div>
                   <div className="result-hero">
                     <span className="result-index">01</span>
                     <div>
-                      <span className="route-label">PRIMARY CANDIDATE</span>
+                      <span className="route-label">
+                        {routeEvaluation
+                          ? "SERVER-SELECTED CANDIDATE"
+                          : "LOCAL PREVIEW CANDIDATE"}
+                      </span>
                       <h3>{routeModel?.displayName ?? "No matching model"}</h3>
                       <p>
                         {priority} · {selected.label} ·{" "}
@@ -1596,15 +1582,13 @@ export default function Home() {
                   </div>
                   <button
                     className="primary-action"
-                    onClick={() =>
-                      toast.success("路由模拟已完成", {
-                        description:
-                          "已生成本地决策链；不会调用 provider，也不会消耗额度。",
-                      })
-                    }
+                    disabled={!activeWorkspaceId || evaluateRouteLab.isPending}
+                    onClick={runRouteEvaluation}
                   >
-                    <Play size={15} fill="currentColor" /> Run scenario{" "}
-                    <span>local</span>
+                    <Play size={15} fill="currentColor" />
+                    {evaluateRouteLab.isPending
+                      ? "Writing server evaluation…"
+                      : "Run server evaluation"}
                   </button>
                 </div>
               </div>
