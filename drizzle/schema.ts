@@ -144,6 +144,8 @@ export const providerConnections = mysqlTable("provider_connections", {
   lastSyncError: text("lastSyncError"),
   circuitOpenUntil: timestamp("circuitOpenUntil"),
   circuitReason: mysqlEnum("circuitReason", ["QUOTA", "RATE_LIMIT", "TIMEOUT", "PROVIDER_ERROR", "MODEL_UNAVAILABLE", "CONTEXT_OVERFLOW", "TOOL_ERROR", "UNKNOWN"]),
+  maxConcurrentExecutions: int("maxConcurrentExecutions").default(4).notNull(),
+  runningExecutions: int("runningExecutions").default(0).notNull(),
   syncIntervalMinutes: int("syncIntervalMinutes").default(15).notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
@@ -222,6 +224,19 @@ export const modelRegistry = mysqlTable("model_registry", {
   isActive: boolean("isActive").default(true).notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 }, table => [index("model_registry_provider_model_idx").on(table.provider, table.modelId)]);
+
+/** Workspace-local model slots prevent one model's running tasks from exceeding the capacity declared by its active registry version. */
+export const modelConcurrencyBudgets = mysqlTable("model_concurrency_budgets", {
+  id: int("id").autoincrement().primaryKey(),
+  workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  modelRegistryId: int("modelRegistryId").notNull().references(() => modelRegistry.id, { onDelete: "cascade" }),
+  maxConcurrentExecutions: int("maxConcurrentExecutions").default(1).notNull(),
+  runningExecutions: int("runningExecutions").default(0).notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+}, table => [
+  uniqueIndex("model_concurrency_workspace_model_unique").on(table.workspaceId, table.modelRegistryId),
+  index("model_concurrency_workspace_idx").on(table.workspaceId),
+]);
 
 export const usageImportBatches = mysqlTable("usage_import_batches", {
   id: int("id").autoincrement().primaryKey(),
@@ -337,6 +352,7 @@ export const taskAttempts = mysqlTable("task_attempts", {
   attemptNumber: int("attemptNumber").notNull(),
   requestedModelId: varchar("requestedModelId", { length: 160 }),
   actualModelId: varchar("actualModelId", { length: 160 }),
+  modelRegistryId: int("modelRegistryId").references(() => modelRegistry.id, { onDelete: "set null" }),
   provider: varchar("provider", { length: 64 }),
   fallback: boolean("fallback").default(false).notNull(),
   fallbackReason: mysqlEnum("fallbackReason", ["quota_low", "rate_limit", "timeout", "provider_error", "model_unavailable", "context_overflow", "tool_error", "manual"]),
@@ -355,6 +371,7 @@ export const taskAttempts = mysqlTable("task_attempts", {
   routeVersion: varchar("routeVersion", { length: 64 }).default("qars-v2").notNull(),
   executionPlan: json("executionPlan").$type<AttemptExecutionPlan>(),
   retryNotBefore: timestamp("retryNotBefore"),
+  concurrencyClaimed: boolean("concurrencyClaimed").default(false).notNull(),
   startedAt: timestamp("startedAt"),
   completedAt: timestamp("completedAt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),

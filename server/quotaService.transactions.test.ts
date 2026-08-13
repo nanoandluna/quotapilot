@@ -560,6 +560,68 @@ describe("QuotaPilot V0.2 transaction guards", () => {
     expect(transaction.insert).toHaveBeenCalledTimes(1);
   });
 
+  it("blocks a claim when the provider-level concurrency budget is full", async () => {
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 50, workspaceId: 7, status: "queued", estimatedCostUsd: "0.100000", taskBudgetUsd: "0.500000", cumulativeCostCapUsd: "0.500000", actualCostUsd: "0", remainingBudgetUsd: "0.500000" }],
+        [{ id: 208, taskId: 50, workspaceId: 7, status: "queued", provider: "opencode_go", modelRegistryId: 77 }],
+        [{ id: 304, taskId: 50, providerBudgetId: 8, reservationKind: "hard", status: "RESERVED" }],
+        [{ id: 5, provider: "opencode_go", maxConcurrentExecutions: 1, runningExecutions: 1, circuitOpenUntil: null }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "12.0000", consumedUsd: "1.0000", reservedUsd: "0.5000" }],
+        [{ id: 77, modelId: "deepseek-v4-flash", maxConcurrency: 2, isActive: true }],
+      ]),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 0 }] })) })),
+      insert: vi.fn(),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction) });
+
+    await expect(claimTaskForLocalExecution({ workspaceId: 7, taskId: 50 })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(transaction.update).toHaveBeenCalledTimes(1);
+    expect(transaction.insert).not.toHaveBeenCalled();
+  });
+
+  it("resolves a legacy NULL modelRegistryId before enforcing provider concurrency instead of bypassing the three-tier budget", async () => {
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 52, workspaceId: 7, status: "queued", estimatedCostUsd: "0.100000", taskBudgetUsd: "0.500000", cumulativeCostCapUsd: "0.500000", actualCostUsd: "0", remainingBudgetUsd: "0.500000", requestedModelId: "deepseek-v4-flash" }],
+        [{ id: 210, taskId: 52, workspaceId: 7, status: "queued", provider: "opencode_go", modelRegistryId: null, requestedModelId: "deepseek-v4-flash" }],
+        [{ id: 306, taskId: 52, providerBudgetId: 8, reservationKind: "hard", status: "RESERVED" }],
+        [{ id: 5, provider: "opencode_go", maxConcurrentExecutions: 1, runningExecutions: 1, circuitOpenUntil: null }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "12.0000", consumedUsd: "1.0000", reservedUsd: "0.5000" }],
+        [{ id: 79, modelId: "deepseek-v4-flash", provider: "opencode_go", maxConcurrency: 2, isActive: true }],
+      ]),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: 0 }] })) })),
+      insert: vi.fn(),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction) });
+
+    await expect(claimTaskForLocalExecution({ workspaceId: 7, taskId: 52 })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(transaction.select).toHaveBeenCalledTimes(6);
+    expect(transaction.update).toHaveBeenCalledTimes(1);
+    expect(transaction.insert).not.toHaveBeenCalled();
+  });
+
+  it("releases a provider slot when the model-level concurrency claim loses its race", async () => {
+    const updateResults = [1, 0, 1];
+    const transaction = {
+      select: sequenceSelect([
+        [{ id: 51, workspaceId: 7, status: "queued", estimatedCostUsd: "0.100000", taskBudgetUsd: "0.500000", cumulativeCostCapUsd: "0.500000", actualCostUsd: "0", remainingBudgetUsd: "0.500000" }],
+        [{ id: 209, taskId: 51, workspaceId: 7, status: "queued", provider: "opencode_go", modelRegistryId: 78 }],
+        [{ id: 305, taskId: 51, providerBudgetId: 8, reservationKind: "hard", status: "RESERVED" }],
+        [{ id: 5, provider: "opencode_go", maxConcurrentExecutions: 2, runningExecutions: 0, circuitOpenUntil: null }],
+        [{ id: 8, workspaceId: 7, providerConnectionId: 5, window: "five_hour", limitUsd: "12.0000", consumedUsd: "1.0000", reservedUsd: "0.5000" }],
+        [{ id: 78, modelId: "deepseek-v4-flash", maxConcurrency: 1, isActive: true }],
+      ]),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: async () => [{ affectedRows: updateResults.shift() ?? 1 }] })) })),
+      insert: vi.fn(() => ({ values: () => ({ onDuplicateKeyUpdate: async () => undefined }) })),
+    };
+    doubles.getDb.mockResolvedValue({ transaction: async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction) });
+
+    await expect(claimTaskForLocalExecution({ workspaceId: 7, taskId: 51 })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(transaction.update).toHaveBeenCalledTimes(3);
+    expect(transaction.insert).toHaveBeenCalledTimes(1);
+  });
+
   it("admits at most one concurrent P2 soft-to-hard claim against the same remaining shared budget", async () => {
     let capacityClaimsRemaining = 1;
     const buildTransaction = (taskId: number, attemptId: number) => {

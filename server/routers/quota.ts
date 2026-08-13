@@ -161,6 +161,24 @@ export const quotaRouter = router({
         const activeConcurrency = runningAttempts.filter(attempt => (attempt.actualModelId ?? attempt.requestedModelId) === candidate.modelId).length;
         if (activeConcurrency >= candidate.maxConcurrency) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "候选模型当前并发已满。" });
         requestedModelId = candidate.modelId;
+        await tx.update(taskAttempts).set({
+          requestedModelId: candidate.modelId,
+          actualModelId: candidate.modelId,
+          modelRegistryId: candidate.id,
+          provider: candidate.provider,
+          executionPlan: {
+            contextReductionRatio: 1,
+            outputReductionRatio: 1,
+            maxToolCalls: null,
+            maxAgentSteps: null,
+            chunkInput: false,
+            preserveRequestedModel: false,
+          },
+        }).where(and(
+          eq(taskAttempts.taskId, task.id),
+          eq(taskAttempts.workspaceId, input.workspaceId),
+          eq(taskAttempts.status, "queued"),
+        ));
       }
 
       const consumed = await tx.update(routeDecisions).set({

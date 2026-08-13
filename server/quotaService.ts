@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import {
   budgetReservations,
   budgetAlerts,
+  modelConcurrencyBudgets,
   modelRegistry,
   providerBudgets,
   providerConnections,
@@ -968,6 +969,7 @@ export async function reserveTaskBudget(input: {
   });
   const { candidates, recommendedModelId } = routing;
   const selectedModel = routingModels.find(model => model.modelId === recommendedModelId);
+  const selectedRegistryModel = models.find(model => model.modelId === recommendedModelId && model.provider === (routing.selectedProvider ?? selectedModel?.provider));
   const attemptProvider = routing.selectedProvider ?? selectedModel?.provider ?? "opencode_go";
   const budget = budgets.find(candidate => candidate.providerConnectionId === connections.find(connection => connection.provider === attemptProvider)?.id) ?? budgets[0];
   if (!budget) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "缺少可用于任务预留的五小时共享预算。" });
@@ -1049,6 +1051,7 @@ export async function reserveTaskBudget(input: {
       attemptNumber: 1,
       requestedModelId: recommendedModelId,
       actualModelId: recommendedModelId,
+      modelRegistryId: selectedRegistryModel?.id,
       provider: attemptProvider,
       quotaState: budget.state,
       resultClass: input.resultClass,
@@ -1122,6 +1125,55 @@ export async function claimTaskForLocalExecution(input: { workspaceId: number; t
       throw new TRPCError({ code: "PRECONDITION_FAILED", message: "执行前任务成本上限校验失败；预计成本超过任务剩余预算。" });
     }
 
+    const concurrencyModel = attempt.modelRegistryId
+      ? (await tx.select().from(modelRegistry).where(and(eq(modelRegistry.id, attempt.modelRegistryId), eq(modelRegistry.isActive, true))).limit(1))[0]
+      : attempt.modelRegistryId === null
+        ? (await tx.select().from(modelRegistry).where(and(
+          eq(modelRegistry.modelId, attempt.requestedModelId ?? task.requestedModelId ?? ""),
+          eq(modelRegistry.provider, attempt.provider as "opencode_go" | "openai_api" | "local"),
+          eq(modelRegistry.isActive, true),
+        )).limit(1))[0]
+        : undefined;
+    if (attempt.modelRegistryId === null && !concurrencyModel) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "旧 attempt 无法匹配活跃模型版本；拒绝绕过模型并发预算领取。" });
+    }
+    let providerConcurrencyClaimed = false;
+    let modelConcurrencyClaimed = false;
+    const releaseConcurrency = async () => {
+      if (modelConcurrencyClaimed && concurrencyModel) {
+        await tx.update(modelConcurrencyBudgets).set({ runningExecutions: sql`GREATEST(${modelConcurrencyBudgets.runningExecutions} - 1, 0)`, updatedAt: new Date() }).where(and(
+          eq(modelConcurrencyBudgets.workspaceId, input.workspaceId),
+          eq(modelConcurrencyBudgets.modelRegistryId, concurrencyModel.id),
+        ));
+      }
+      if (providerConcurrencyClaimed && connection) {
+        await tx.update(providerConnections).set({ runningExecutions: sql`GREATEST(${providerConnections.runningExecutions} - 1, 0)`, updatedAt: new Date() }).where(eq(providerConnections.id, connection.id));
+      }
+    };
+    if (concurrencyModel && connection) {
+      const providerClaim = await tx.update(providerConnections).set({ runningExecutions: sql`${providerConnections.runningExecutions} + 1`, updatedAt: new Date() }).where(and(
+        eq(providerConnections.id, connection.id),
+        sql`${providerConnections.runningExecutions} < ${providerConnections.maxConcurrentExecutions}`,
+      ));
+      if (providerClaim[0].affectedRows !== 1) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Provider 并发槽位已满；任务保持排队。" });
+      providerConcurrencyClaimed = true;
+      await tx.insert(modelConcurrencyBudgets).values({
+        workspaceId: input.workspaceId,
+        modelRegistryId: concurrencyModel.id,
+        maxConcurrentExecutions: concurrencyModel.maxConcurrency,
+      }).onDuplicateKeyUpdate({ set: { maxConcurrentExecutions: concurrencyModel.maxConcurrency, updatedAt: new Date() } });
+      const modelClaim = await tx.update(modelConcurrencyBudgets).set({ runningExecutions: sql`${modelConcurrencyBudgets.runningExecutions} + 1`, updatedAt: new Date() }).where(and(
+        eq(modelConcurrencyBudgets.workspaceId, input.workspaceId),
+        eq(modelConcurrencyBudgets.modelRegistryId, concurrencyModel.id),
+        sql`${modelConcurrencyBudgets.runningExecutions} < ${modelConcurrencyBudgets.maxConcurrentExecutions}`,
+      ));
+      if (modelClaim[0].affectedRows !== 1) {
+        await releaseConcurrency();
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "模型并发槽位已满；任务保持排队。" });
+      }
+      modelConcurrencyClaimed = true;
+    }
+
     let claimKind: "existing_hard" | "soft_upgraded" | "p3_hard" = "existing_hard";
     if (!reservation || reservation.reservationKind === "soft" || reservation.status !== "RESERVED") {
       const conditionalReserve = await tx.update(providerBudgets).set({
@@ -1155,9 +1207,15 @@ export async function claimTaskForLocalExecution(input: { workspaceId: number; t
       eq(researchTasks.id, task.id),
       inArray(researchTasks.status, ["queued", "reserved"]),
     ));
-    if (taskClaim[0].affectedRows !== 1) throw new TRPCError({ code: "CONFLICT", message: "任务已被其他执行者领取。" });
-    const attemptClaim = await tx.update(taskAttempts).set({ status: "running", startedAt: new Date() }).where(and(eq(taskAttempts.id, attempt.id), eq(taskAttempts.status, "queued")));
-    if (attemptClaim[0].affectedRows !== 1) throw new TRPCError({ code: "CONFLICT", message: "attempt 已被其他执行者领取。" });
+    if (taskClaim[0].affectedRows !== 1) {
+      await releaseConcurrency();
+      throw new TRPCError({ code: "CONFLICT", message: "任务已被其他执行者领取。" });
+    }
+    const attemptClaim = await tx.update(taskAttempts).set({ status: "running", modelRegistryId: concurrencyModel?.id ?? attempt.modelRegistryId, concurrencyClaimed: modelConcurrencyClaimed, startedAt: new Date() }).where(and(eq(taskAttempts.id, attempt.id), eq(taskAttempts.status, "queued")));
+    if (attemptClaim[0].affectedRows !== 1) {
+      await releaseConcurrency();
+      throw new TRPCError({ code: "CONFLICT", message: "attempt 已被其他执行者领取。" });
+    }
     return { taskId: task.id, attemptId: attempt.id, claimKind, provider: attempt.provider ?? "unknown", executionPlan: attempt.executionPlan ?? null };
   });
   await refreshWorkspaceBudgets(input.workspaceId);
@@ -1234,6 +1292,7 @@ export async function recordTaskAttemptExecution(input: {
         attemptNumber: Number(attemptNumber) + 1,
         requestedModelId: task.requestedModelId,
         actualModelId: task.requestedModelId,
+        modelRegistryId: attempt.modelRegistryId,
         provider: attempt.provider,
         quotaState: attempt.quotaState,
         resultClass: finalResultClass,
@@ -1267,6 +1326,17 @@ export async function recordTaskAttemptExecution(input: {
     const reservationStatus = input.status === "completed" ? "CONSUMED" : "RELEASED";
     await tx.update(budgetReservations).set({ status: reservationStatus, updatedAt: new Date() }).where(and(eq(budgetReservations.taskId, task.id), eq(budgetReservations.status, "RESERVED")));
     const connection = (await tx.select().from(providerConnections).where(and(eq(providerConnections.workspaceId, input.workspaceId), eq(providerConnections.provider, (attempt.provider ?? "opencode_go") as "opencode_go" | "openai_api" | "chatgpt_plus_manual" | "local"))).limit(1))[0];
+    if (attempt.concurrencyClaimed) {
+      if (attempt.modelRegistryId) {
+        await tx.update(modelConcurrencyBudgets).set({ runningExecutions: sql`GREATEST(${modelConcurrencyBudgets.runningExecutions} - 1, 0)`, updatedAt: new Date() }).where(and(
+          eq(modelConcurrencyBudgets.workspaceId, input.workspaceId),
+          eq(modelConcurrencyBudgets.modelRegistryId, attempt.modelRegistryId),
+        ));
+      }
+      if (connection) {
+        await tx.update(providerConnections).set({ runningExecutions: sql`GREATEST(${providerConnections.runningExecutions} - 1, 0)`, updatedAt: new Date() }).where(eq(providerConnections.id, connection.id));
+      }
+    }
     if (failurePolicy && (failurePolicy.circuitScope === "provider" || failurePolicy.circuitScope === "provider_window") && connection) {
       const circuitOpenUntil = retryNotBefore ?? new Date(Date.now() + 5 * 60 * 1_000);
       await tx.update(providerConnections).set({ connectionState: "degraded", circuitOpenUntil, circuitReason: failureReason, updatedAt: new Date() }).where(eq(providerConnections.id, connection.id));
@@ -1302,6 +1372,7 @@ export async function queueTaskRetry(input: { workspaceId: number; taskId: numbe
       attemptNumber: nextAttemptNumber,
       requestedModelId: task.requestedModelId,
       actualModelId: task.requestedModelId,
+      modelRegistryId: previousAttempt?.modelRegistryId,
       provider: previousAttempt?.provider ?? "opencode_go",
       quotaState: previousAttempt?.quotaState,
       resultClass: task.resultClass,

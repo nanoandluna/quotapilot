@@ -26,7 +26,14 @@ vi.mock("./quotaService", () => ({
 import { quotaRouter } from "./routers/quota";
 
 function selectRows<T>(rows: T[]) {
-  return { from: () => ({ where: () => ({ limit: async () => rows }) }) };
+  const query = {
+    limit: async () => rows,
+    then: <TResult1 = T[], TResult2 = never>(
+      onfulfilled?: ((value: T[]) => TResult1 | PromiseLike<TResult1>) | null,
+      onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+    ) => Promise.resolve(rows).then(onfulfilled, onrejected),
+  };
+  return { from: () => ({ where: () => query }) };
 }
 
 function authenticatedContext(): TrpcContext {
@@ -79,6 +86,36 @@ describe("QuotaPilot V2 route decision state machine", () => {
     await expect(caller.actOnRouteDecision({ workspaceId: 7, decisionId: 99, action: "hold" })).rejects.toMatchObject({ code: "CONFLICT" });
 
     expect(transaction.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("binds a manually selected migration candidate to the queued attempt before releasing the task back to queue", async () => {
+    const rows = [
+      [{ id: 100, workspaceId: 7, taskId: 43, admissionDecision: "MIGRATE", selectedModelId: "deepseek-v4-flash", actedAt: null }],
+      [{ id: 43, workspaceId: 7, status: "paused", admissionDecision: "MIGRATE", requestedModelId: "deepseek-v4-flash", requirements: {}, estimatedCostUsd: "0.100000" }],
+      [{ id: 88, provider: "opencode_go", modelId: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", inputPerMillionUsd: "0.4", outputPerMillionUsd: "0.8", scarcityFactor: "0.7", maxConcurrency: 2, maxContextTokens: 128000, capability: {}, isActive: true }],
+      [{ id: 5, provider: "opencode_go", connectionState: "connected", secretState: "configured" }],
+      [{ id: 8, providerConnectionId: 5, window: "five_hour", limitUsd: "10", consumedUsd: "1", reservedUsd: "0" }],
+      [],
+    ];
+    const updateSets = vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] }));
+    const transaction = {
+      select: vi.fn(() => selectRows(rows.shift() ?? [])),
+      update: vi.fn(() => ({ set: updateSets })),
+    };
+    doubles.scoreCandidateModels.mockReturnValue([{ modelId: "deepseek-v4-pro" }]);
+    doubles.getDb.mockResolvedValue({ transaction: vi.fn((work: (tx: typeof transaction) => Promise<unknown>) => work(transaction)) });
+
+    const caller = quotaRouter.createCaller(authenticatedContext());
+    const result = await caller.actOnRouteDecision({ workspaceId: 7, decisionId: 100, action: "migrate", candidateModelId: "deepseek-v4-pro" });
+
+    expect(result).toMatchObject({ ok: true, taskId: 43, status: "queued" });
+    expect(updateSets.mock.calls[0]?.[0]).toMatchObject({
+      requestedModelId: "deepseek-v4-pro",
+      actualModelId: "deepseek-v4-pro",
+      modelRegistryId: 88,
+      provider: "opencode_go",
+      executionPlan: { preserveRequestedModel: false },
+    });
   });
 
   it("accepts a pending invite only for the invited email and binds the member transactionally", async () => {
