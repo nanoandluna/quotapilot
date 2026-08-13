@@ -208,6 +208,9 @@ export const researchTasks = mysqlTable("research_tasks", {
     .default("draft")
     .notNull(),
   routeMode: mysqlEnum("routeMode", ["strict", "balanced", "emergency"]).default("balanced").notNull(),
+  admissionDecision: mysqlEnum("admissionDecision", ["ADMIT", "RESERVE", "MIGRATE", "QUEUE", "HOLD"])
+    .default("ADMIT")
+    .notNull(),
   resultClass: mysqlEnum("resultClass", ["official", "fallback", "exploratory", "recovery"]).default("exploratory").notNull(),
   experimentId: varchar("experimentId", { length: 128 }),
   runId: varchar("runId", { length: 128 }),
@@ -274,6 +277,28 @@ export const taskAttempts = mysqlTable("task_attempts", {
 }, table => [
   uniqueIndex("task_attempts_task_number_unique").on(table.taskId, table.attemptNumber),
   index("task_attempts_workspace_created_idx").on(table.workspaceId, table.createdAt),
+]);
+
+export const routeDecisions = mysqlTable("route_decisions", {
+  id: int("id").autoincrement().primaryKey(),
+  workspaceId: int("workspaceId").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  taskId: int("taskId").notNull().references(() => researchTasks.id, { onDelete: "cascade" }),
+  attemptId: int("attemptId").references(() => taskAttempts.id, { onDelete: "set null" }),
+  admissionDecision: mysqlEnum("routeDecision", ["ADMIT", "RESERVE", "MIGRATE", "QUEUE", "HOLD"]).notNull(),
+  budgetState: mysqlEnum("routeBudgetState", ["GREEN", "YELLOW", "ORANGE", "DRAIN_PROTECTION", "RED"]).notNull(),
+  availableUsd: decimal("availableUsd", { precision: 12, scale: 6 }).notNull(),
+  dynamicReserveUsd: decimal("dynamicReserveUsd", { precision: 12, scale: 6 }).notNull(),
+  estimatedCostUsd: decimal("estimatedCostUsd", { precision: 12, scale: 6 }).notNull(),
+  reason: text("reason").notNull(),
+  recommendedAction: mysqlEnum("recommendedAction", ["run", "reserve", "migrate", "queue", "hold", "manual_handoff"]).notNull(),
+  selectedModelId: varchar("selectedModelId", { length: 160 }),
+  requiresHumanHandoff: boolean("requiresHumanHandoff").default(false).notNull(),
+  actedAt: timestamp("actedAt"),
+  actedByUserId: int("actedByUserId").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, table => [
+  index("route_decisions_task_created_idx").on(table.taskId, table.createdAt),
+  index("route_decisions_workspace_created_idx").on(table.workspaceId, table.createdAt),
 ]);
 
 export const budgetAlerts = mysqlTable("budget_alerts", {

@@ -44,4 +44,26 @@ describe("QuotaPilot V2 budget engine", () => {
 
     expect(decision).toBe("QUEUE");
   });
+
+  it("migrates noncritical work in an orange budget state before it touches the reserve", () => {
+    expect(getAdmissionDecision({
+      priority: "P3",
+      routeMode: "balanced",
+      estimatedCostUsd: 0.2,
+      availableUsd: 1.5,
+      dynamicReserveUsd: 0.5,
+      budgetState: "ORANGE",
+    })).toBe("MIGRATE");
+  });
+
+  it("holds work when the shared budget is red or below the task estimate", () => {
+    expect(getAdmissionDecision({
+      priority: "P1",
+      routeMode: "strict",
+      estimatedCostUsd: 0.5,
+      availableUsd: 0.4,
+      dynamicReserveUsd: 0.1,
+      budgetState: "RED",
+    })).toBe("HOLD");
+  });
 });

@@ -19,10 +19,23 @@
 
 ## 调度与预算告警
 
+- [x] 将 route decision 操作直接嵌入任务队列表每一行，覆盖全部可处理任务而非仅 recent summary。
+- [ ] 为任务队列逐条 migrate、queue、hold、manual handoff 操作补充服务端与前端测试，验证状态反馈和持久化结果。
+- [x] 为 MIGRATE 增加候选模型选择界面，并将用户选择的模型与处理状态持久化到 task 和 route decision。
+- [x] 区分并实现继续排队、保持暂停和人工交接确认三种操作流及状态文案。
+- [x] 在任务队列的每条可处理任务上提供 route decision 操作入口与处理后反馈。
+- [x] 在任务队列展示 admissionDecision 与 route decision 摘要、原因和建议动作。
+- [x] 为 MIGRATE、QUEUE、HOLD 增加迁移候选、继续排队、保持暂停与人工交接确认操作，并将处理状态回写 route_decision 和任务。
+- [ ] 为 route decision 的任务页、账本页和交接操作流补充前端/服务端测试。
+- [x] 新增持久化 route_decision 记录，关联任务与 attempt，保存准入决策、触发阈值、原因、建议动作和人工接管要求。
+- [x] 在任务与账本界面展示 route_decision 历史，并提供 migrate、queue、hold 与 manual handoff 的明确操作流。
+- [ ] 为 MIGRATE、QUEUE、HOLD 的路由决策持久化和前端展示补充测试。
+- [x] 将 MIGRATE、QUEUE、HOLD 准入决策落入任务状态和路由决策记录，并在控制台展示后续操作与人工接管要求。
+- [ ] 为提前迁移阈值增加端到端测试，覆盖低于保护仓、DRAIN_PROTECTION、ORANGE 与 RED 场景的迁移、排队和暂停行为。
 - [ ] 实现真实任务/请求执行账本流程：每次调用关联 task_attempt，记录输入/输出/缓存 token、预估/实际成本和执行结果。
 - [ ] 补全额度预留生命周期：任务成功时转 CONSUMED，失败、取消或过期时转 RELEASED，并覆盖测试。
-- [ ] 将 resultClass 下沉至 attempt/ledger 层，并由服务端阻止 fallback 或 recovery attempt 被写为 official 结果。
-- [ ] 增加可执行的提前迁移阈值：基于 available、dynamic reserve 和 burn rate 决定迁移、排队或人工接管。
+- [x] 将 resultClass 下沉至 attempt/ledger 层，并由服务端阻止 fallback 或 recovery attempt 被写为 official 结果。
+- [x] 增加可执行的提前迁移阈值：基于 available、dynamic reserve 和 burn rate 决定迁移、排队或人工接管。
 - [x] 将 OpenCode Go 的调度基础从“模型独立额度”改为 5 小时、周、月共享美元预算，并对每次请求记录输入、输出、缓存 token、预估成本和实际成本。
 - [x] 以模型成本和稀缺性系数而非独立模型余额定义调度惩罚，避免将官方典型请求数误当作模型专属额度。
 - [x] 修正模型目录的来源与版本；将 ChatGPT Plus 从普通 API provider pool 中拆出，定位为人工/外部救援通道。
@@ -42,7 +55,7 @@
 - [ ] 将额度感知路由器从前端模拟逻辑迁移为服务端可审计策略。
 - [x] 实现 5 小时、周、月窗口的预算预测、保护仓、burn rate 和提前迁移阈值。
 - [ ] 实现预算告警：进入 YELLOW/ORANGE/RED、预测重置前耗尽、连接失效和队列阻塞。
-- [ ] 建立站内通知与告警确认状态，避免同一事件重复告警。
+- [x] 建立站内通知与告警确认状态，避免同一事件重复告警。
 
 ## 真实任务队列
 

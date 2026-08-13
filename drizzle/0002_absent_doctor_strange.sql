@@ -1,0 +1,1 @@
+ALTER TABLE `research_tasks` ADD `admissionDecision` enum('ADMIT','RESERVE','MIGRATE','QUEUE','HOLD') DEFAULT 'ADMIT' NOT NULL;

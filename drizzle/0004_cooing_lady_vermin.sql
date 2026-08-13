@@ -1,0 +1,1 @@
+ALTER TABLE `route_decisions` ADD `selectedModelId` varchar(160);

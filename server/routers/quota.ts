@@ -1,7 +1,7 @@
 import { TRPCError } from "@trpc/server";
 import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
-import { budgetAlerts, workspaceInvites, workspaceMembers } from "../../drizzle/schema";
+import { budgetAlerts, researchTasks, routeDecisions, workspaceInvites, workspaceMembers } from "../../drizzle/schema";
 import { getDb } from "../db";
 import {
   ensurePersonalWorkspace,
@@ -72,6 +72,32 @@ export const quotaRouter = router({
   })).mutation(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
     return recordTaskAttemptExecution(input);
+  }),
+  actOnRouteDecision: protectedProcedure.input(z.object({
+    workspaceId: z.number().int().positive(),
+    decisionId: z.number().int().positive(),
+    action: z.enum(["migrate", "queue", "hold", "manual_handoff"]),
+    candidateModelId: z.string().min(1).max(160).optional(),
+  })).mutation(async ({ ctx, input }) => {
+    await requireWorkspaceRole(input.workspaceId, ctx.user.id, "researcher");
+    if (input.action === "migrate" && !input.candidateModelId) throw new TRPCError({ code: "BAD_REQUEST", message: "迁移操作需要指定候选模型。" });
+    const db = await getDb();
+    if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
+    const decision = (await db.select().from(routeDecisions).where(and(eq(routeDecisions.id, input.decisionId), eq(routeDecisions.workspaceId, input.workspaceId))).limit(1))[0];
+    if (!decision) throw new TRPCError({ code: "NOT_FOUND", message: "route decision 不存在。" });
+    const update = input.action === "migrate"
+      ? { status: "queued" as const, admissionDecision: "MIGRATE" as const, requestedModelId: input.candidateModelId, updatedAt: new Date() }
+      : input.action === "queue"
+        ? { status: "queued" as const, admissionDecision: "QUEUE" as const, updatedAt: new Date() }
+        : { status: "paused" as const, admissionDecision: "HOLD" as const, updatedAt: new Date() };
+    await db.update(researchTasks).set(update).where(and(eq(researchTasks.id, decision.taskId), eq(researchTasks.workspaceId, input.workspaceId)));
+    await db.update(routeDecisions).set({
+      actedAt: new Date(),
+      actedByUserId: ctx.user.id,
+      recommendedAction: input.action,
+      selectedModelId: input.action === "migrate" ? input.candidateModelId : decision.selectedModelId,
+    }).where(eq(routeDecisions.id, decision.id));
+    return { ok: true, taskId: decision.taskId, status: update.status };
   }),
   alerts: protectedProcedure.input(workspaceInput).query(async ({ ctx, input }) => {
     await requireWorkspaceRole(input.workspaceId, ctx.user.id);

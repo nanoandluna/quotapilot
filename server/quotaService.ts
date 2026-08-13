@@ -1,12 +1,14 @@
-import { and, desc, eq, gte, lte } from "drizzle-orm";
+import { and, desc, eq, gte, isNull, lte } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { createHash } from "node:crypto";
 import {
   budgetReservations,
+  budgetAlerts,
   modelRegistry,
   providerBudgets,
   providerConnections,
   researchTasks,
+  routeDecisions,
   schedulerSettings,
   taskAttempts,
   usageEvents,
@@ -117,6 +119,14 @@ export function getAdmissionDecision(input: {
   }
   if (input.budgetState === "ORANGE" && (input.priority === "P2" || input.priority === "P3")) return "MIGRATE";
   return "ADMIT";
+}
+
+function describeRouteDecision(decision: "ADMIT" | "RESERVE" | "MIGRATE" | "QUEUE" | "HOLD") {
+  if (decision === "RESERVE") return { reason: "P0/P1 任务通过共享预算检查，需先锁定可预估成本。", action: "reserve" as const, human: false };
+  if (decision === "MIGRATE") return { reason: "当前窗口接近动态保护仓；非关键任务应迁移到能力合格、成本更低的模型。", action: "migrate" as const, human: true };
+  if (decision === "QUEUE") return { reason: "动态保护仓或 DRAIN_PROTECTION 正在保护 P0/P1 连续性，任务需等待预算恢复。", action: "queue" as const, human: false };
+  if (decision === "HOLD") return { reason: "共享窗口余额不足以覆盖任务预估成本，不能静默降级。", action: "manual_handoff" as const, human: true };
+  return { reason: "能力、成本和共享预算均满足当前任务准入条件。", action: "run" as const, human: false };
 }
 
 export function parseUsageImport(content: string, format: "csv" | "json"): Array<{
@@ -293,6 +303,24 @@ async function seedWorkspaceDefaults(workspaceId: number) {
   await db.insert(schedulerSettings).values({ workspaceId }).onDuplicateKeyUpdate({ set: { updatedAt: new Date() } });
 }
 
+async function createUnacknowledgedAlert(input: {
+  workspaceId: number;
+  providerBudgetId?: number;
+  severity: "info" | "warning" | "critical";
+  kind: "budget_state" | "forecast_exhaustion" | "connection" | "queue_blocked" | "reservation" | "import";
+  title: string;
+  message: string;
+}) {
+  const db = await getDb();
+  if (!db) return;
+  const dedupeKey = `${input.kind}:${input.providerBudgetId ?? "workspace"}`;
+  const existing = (await db.select({ id: budgetAlerts.id }).from(budgetAlerts).where(and(
+    eq(budgetAlerts.workspaceId, input.workspaceId),
+    eq(budgetAlerts.dedupeKey, dedupeKey),
+  )).limit(1))[0];
+  if (!existing) await db.insert(budgetAlerts).values({ ...input, dedupeKey });
+}
+
 export async function refreshWorkspaceBudgets(workspaceId: number) {
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "数据库连接不可用。" });
@@ -330,7 +358,35 @@ export async function refreshWorkspaceBudgets(workspaceId: number) {
       state: state.state,
       updatedAt: new Date(),
     }).where(eq(providerBudgets.id, budget.id));
+    if (state.state !== "GREEN") {
+      await createUnacknowledgedAlert({
+        workspaceId,
+        providerBudgetId: budget.id,
+        severity: state.state === "RED" || state.state === "DRAIN_PROTECTION" ? "critical" : "warning",
+        kind: "budget_state",
+        title: `${budget.window} 共享预算处于 ${state.state}`,
+        message: `可用余额 ${state.availableUsd.toFixed(4)} USD；动态保护仓 ${dynamicReserve.toFixed(4)} USD。`,
+      });
+    }
+    if (state.forecastExhaustionAt && state.forecastExhaustionAt.getTime() < budget.resetAt.getTime()) {
+      await createUnacknowledgedAlert({
+        workspaceId,
+        providerBudgetId: budget.id,
+        severity: "warning",
+        kind: "forecast_exhaustion",
+        title: `${budget.window} 预计在重置前耗尽`,
+        message: `预测耗尽时间：${state.forecastExhaustionAt.toISOString()}；请迁移非关键任务或降低任务消耗。`,
+      });
+    }
   }
+  const pausedTask = (await db.select({ id: researchTasks.id }).from(researchTasks).where(and(eq(researchTasks.workspaceId, workspaceId), eq(researchTasks.status, "paused"))).limit(1))[0];
+  if (pausedTask) await createUnacknowledgedAlert({
+    workspaceId,
+    severity: "warning",
+    kind: "queue_blocked",
+    title: "任务队列存在暂停项",
+    message: "至少一个任务无法通过共享预算准入检查；请补充额度、等待重置或手动调整任务预算。",
+  });
 }
 
 function sumCostSince(events: Array<typeof usageEvents.$inferSelect>, now: Date, rangeMs: number) {
@@ -446,9 +502,10 @@ export async function reserveTaskBudget(input: {
     dynamicReserveUsd: asNumber(budget.dynamicReserveUsd),
     budgetState: budget.state,
   });
+  const decisionDetails = describeRouteDecision(admission);
   if (requiresReservation && admission === "HOLD") {
-    await db.update(researchTasks).set({ status: "paused", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
-    await db.insert(taskAttempts).values({
+    await db.update(researchTasks).set({ status: "paused", admissionDecision: "HOLD", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
+    const attemptResult = await db.insert(taskAttempts).values({
       workspaceId: input.workspaceId,
       taskId,
       attemptNumber: 1,
@@ -460,7 +517,27 @@ export async function reserveTaskBudget(input: {
       estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
       status: "queued",
     });
+    await db.insert(routeDecisions).values({
+      workspaceId: input.workspaceId,
+      taskId,
+      attemptId: Number(attemptResult[0].insertId),
+      admissionDecision: admission,
+      budgetState: budget.state,
+      availableUsd: available.toFixed(6),
+      dynamicReserveUsd: asNumber(budget.dynamicReserveUsd).toFixed(6),
+      estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
+      reason: decisionDetails.reason,
+      recommendedAction: decisionDetails.action,
+      requiresHumanHandoff: decisionDetails.human,
+    });
     return { taskId, reserved: false, state: "PAUSED", admission: "HOLD" as const };
+  }
+  if (admission === "MIGRATE") {
+    await db.update(researchTasks).set({ status: "paused", admissionDecision: "MIGRATE", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
+  } else if (admission === "QUEUE") {
+    await db.update(researchTasks).set({ status: "queued", admissionDecision: "QUEUE", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
+  } else if (admission === "ADMIT") {
+    await db.update(researchTasks).set({ status: "queued", admissionDecision: "ADMIT", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
   }
   if (requiresReservation) {
     await db.insert(budgetReservations).values({
@@ -471,9 +548,9 @@ export async function reserveTaskBudget(input: {
       status: "RESERVED",
       expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000),
     });
-    await db.update(researchTasks).set({ status: "reserved", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
+    await db.update(researchTasks).set({ status: "reserved", admissionDecision: "RESERVE", updatedAt: new Date() }).where(eq(researchTasks.id, taskId));
   }
-  await db.insert(taskAttempts).values({
+  const attemptResult = await db.insert(taskAttempts).values({
     workspaceId: input.workspaceId,
     taskId,
     attemptNumber: 1,
@@ -484,6 +561,19 @@ export async function reserveTaskBudget(input: {
     resultClass: input.resultClass,
     estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
     status: "queued",
+  });
+  await db.insert(routeDecisions).values({
+    workspaceId: input.workspaceId,
+    taskId,
+    attemptId: Number(attemptResult[0].insertId),
+    admissionDecision: admission,
+    budgetState: budget.state,
+    availableUsd: available.toFixed(6),
+    dynamicReserveUsd: asNumber(budget.dynamicReserveUsd).toFixed(6),
+    estimatedCostUsd: input.estimatedCostUsd.toFixed(6),
+    reason: decisionDetails.reason,
+    recommendedAction: decisionDetails.action,
+    requiresHumanHandoff: decisionDetails.human,
   });
   await refreshWorkspaceBudgets(input.workspaceId);
   return { taskId, reserved: requiresReservation, state: requiresReservation ? "RESERVED" : "QUEUED", admission };
@@ -570,5 +660,7 @@ export async function listWorkspaceDashboard(workspaceId: number) {
   const attempts = await db.select().from(taskAttempts).where(eq(taskAttempts.workspaceId, workspaceId)).orderBy(desc(taskAttempts.createdAt)).limit(36);
   const events = await db.select().from(usageEvents).where(and(eq(usageEvents.workspaceId, workspaceId), gte(usageEvents.occurredAt, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)))).orderBy(desc(usageEvents.occurredAt));
   const reservations = await db.select().from(budgetReservations).where(and(eq(budgetReservations.workspaceId, workspaceId), eq(budgetReservations.status, "RESERVED")));
-  return { workspace, connections, budgets, models, tasks, attempts, events, reservations };
+  const alerts = await db.select().from(budgetAlerts).where(eq(budgetAlerts.workspaceId, workspaceId)).orderBy(desc(budgetAlerts.createdAt)).limit(12);
+  const decisions = await db.select().from(routeDecisions).where(eq(routeDecisions.workspaceId, workspaceId)).orderBy(desc(routeDecisions.createdAt)).limit(24);
+  return { workspace, connections, budgets, models, tasks, attempts, events, reservations, alerts, decisions };
 }
